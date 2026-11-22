@@ -1,0 +1,3543 @@
+---
+title: "A_interaction Dibao"
+author: "Haoran Hao"
+date: "2026-09-15"
+output: html_document
+---
+
+```{r}
+# 0. Settings
+# ---------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "A_Cox_outputs")
+COMMON_RDS <- file.path(OUTPUT_DIR, "A_Cox_common_data.rds")
+EVER_RESULTS_RDS <- file.path(OUTPUT_DIR, "A_Ever_models_and_results.rds")
+NEVER_RESULTS_RDS <- file.path(OUTPUT_DIR, "A_Never_models_and_results.rds")
+
+# Stability threshold for PRIMARY substantive interaction levels.
+# Every non-reference level in a primary interaction must have at least this
+# many deaths in BOTH Dibao groups. The current dataset satisfies this for all
+# primary substantive levels. This rule prevents zero-event/quasi-separation
+# from silently entering a formal primary interaction test.
+MIN_EVENTS_PER_GROUP_LEVEL <- 5L
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "csv"), showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+
+options(stringsAsFactors = FALSE)
+
+if (!file.exists(COMMON_RDS)) {
+  stop(
+    "A_Cox_common_data.rds was not found at: ", COMMON_RDS, "\n",
+    "Run A_Ever_Dibao_Cox_revised.R first."
+  )
+}
+
+if (!file.exists(EVER_RESULTS_RDS)) {
+  stop(
+    "A_Ever_models_and_results.rds was not found at: ", EVER_RESULTS_RDS,
+    "\nRun A_Ever_Dibao_Cox_revised.R before the interaction analysis."
+  )
+}
+
+if (!file.exists(NEVER_RESULTS_RDS)) {
+  stop(
+    "A_Never_models_and_results.rds was not found at: ", NEVER_RESULTS_RDS,
+    "\nRun A_Never_Dibao_Cox_revised.R before the interaction analysis."
+  )
+}
+
+# The interaction model itself uses the common RDS for formal estimation.
+# The two group-specific RDS files are also loaded only to export a descriptive
+# side-by-side comparison of the already-fitted separate-group main Cox models.
+ever_results_object <- readRDS(EVER_RESULTS_RDS)
+never_results_object <- readRDS(NEVER_RESULTS_RDS)
+```
+
+
+```{r}
+# 1. Helper functions
+# ---------------------------
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  list(
+    fit = fit,
+    warnings = unique(warnings_seen)
+  )
+}
+
+extract_cox_results <- function(fit) {
+  s <- summary(fit)
+  coef_table <- as.data.frame(s$coefficients)
+  ci_table <- as.data.frame(s$conf.int)
+
+  out <- data.frame(
+    term = rownames(coef_table),
+    beta = coef_table[, "coef"],
+    HR = ci_table[, "exp(coef)"],
+    lower_95 = ci_table[, "lower .95"],
+    upper_95 = ci_table[, "upper .95"],
+    p_value = coef_table[, "Pr(>|z|)"],
+    row.names = NULL,
+    check.names = FALSE
+  )
+
+  if ("robust se" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "robust se"]
+  } else if ("se(coef)" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "se(coef)"]
+  } else {
+    out$robust_se <- NA_real_
+  }
+
+  out[, c(
+    "term", "beta", "robust_se", "HR",
+    "lower_95", "upper_95", "p_value"
+  )]
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(
+      fit,
+      transform = "km",
+      terms = TRUE,
+      global = TRUE
+    ),
+    error = function(e) {
+      structure(
+        list(message = conditionMessage(e)),
+        class = "cox_zph_error"
+      )
+    }
+  )
+}
+
+ph_table <- function(ph_object, model_name) {
+  if (inherits(ph_object, "cox_zph_error")) {
+    return(data.frame(
+      model = model_name,
+      term = "PH_TEST_ERROR",
+      chisq = NA_real_,
+      df = NA_real_,
+      p = NA_real_,
+      message = ph_object$message,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  x <- as.data.frame(ph_object$table)
+  x$term <- rownames(x)
+  x$model <- model_name
+  x$message <- NA_character_
+  rownames(x) <- NULL
+
+  x[, c(
+    "model", "term",
+    setdiff(names(x), c("model", "term"))
+  ), drop = FALSE]
+}
+
+# PH diagnostic strategy:
+# 1) run cox.zph() on the formal clustered-robust Cox fit;
+# 2) only if the robust fit is computationally singular for cox.zph(),
+#    fit the exact same Cox formula without cluster/robust variance solely for
+#    PH diagnostics. The fallback does NOT replace the formal interaction HRs.
+run_ph_diagnostic <- function(formula, data, clustered_fit, model_name) {
+  primary <- safe_cox_zph(clustered_fit)
+
+  if (!inherits(primary, "cox_zph_error")) {
+    tab <- ph_table(primary, model_name)
+    tab$diagnostic_source <- "clustered robust Cox fit"
+    tab$primary_error <- NA_character_
+
+    return(list(
+      object = primary,
+      table = tab,
+      source = "clustered robust Cox fit",
+      primary_error = NA_character_
+    ))
+  }
+
+  diagnostic_fit <- coxph(
+    formula,
+    data = data,
+    ties = "efron",
+    x = TRUE,
+    model = TRUE
+  )
+
+  fallback <- safe_cox_zph(diagnostic_fit)
+  tab <- ph_table(fallback, model_name)
+  tab$diagnostic_source <- "same formula, unclustered diagnostic fallback"
+  tab$primary_error <- primary$message
+
+  list(
+    object = fallback,
+    table = tab,
+    source = "same formula, unclustered diagnostic fallback",
+    primary_error = primary$message
+  )
+}
+
+# Robust joint Wald test for a block of interaction coefficients.
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_,
+      status = "No coefficients found"
+    ))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = length(coefficient_names),
+      p_value = NA_real_,
+      status = "Non-finite coefficient/variance; inspect sparse cells"
+    ))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_,
+      status = "Robust covariance block has rank 0"
+    ))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+  p <- pchisq(W, df = df, lower.tail = FALSE)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = p,
+    status = ifelse(
+      df < length(coefficient_names),
+      "Reduced-rank robust Wald test",
+      "OK"
+    )
+  )
+}
+
+single_coefficient_stats <- function(fit, term) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  if (!(term %in% names(b)) || !is.finite(b[term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  if (!is.finite(V[term, term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  est <- unname(b[term])
+  se <- sqrt(V[term, term])
+  p <- 2 * pnorm(abs(est / se), lower.tail = FALSE)
+
+  c(est = est, se = se, p = p)
+}
+
+linear_combination_stats <- function(fit, weights) {
+  b <- coef(fit)
+  V <- vcov(fit)
+  needed <- names(weights)
+
+  if (any(!(needed %in% names(b)))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  if (any(!is.finite(b[needed])) ||
+      any(!is.finite(V[needed, needed, drop = FALSE]))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  w <- rep(0, length(b))
+  names(w) <- names(b)
+  w[needed] <- weights
+
+  est <- sum(w * b)
+  se <- sqrt(as.numeric(t(w) %*% V %*% w))
+  p <- 2 * pnorm(abs(est / se), lower.tail = FALSE)
+
+  c(est = est, se = se, p = p)
+}
+
+stats_to_hr <- function(stats) {
+  est <- unname(stats["est"])
+  se <- unname(stats["se"])
+  p <- unname(stats["p"])
+
+  if (!is.finite(est) || !is.finite(se)) {
+    return(c(
+      HR = NA_real_, lower_95 = NA_real_, upper_95 = NA_real_, p = NA_real_
+    ))
+  }
+
+  c(
+    HR = exp(est),
+    lower_95 = exp(est - 1.96 * se),
+    upper_95 = exp(est + 1.96 * se),
+    p = p
+  )
+}
+
+safe_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("_+$", "", x)
+  x
+}
+
+add_interaction_columns <- function(data, variable, levels_to_interact) {
+  int_names <- character(0)
+  level_map <- data.frame(
+    variable = character(0),
+    level = character(0),
+    interaction_term = character(0),
+    stringsAsFactors = FALSE
+  )
+
+  for (lev in levels_to_interact) {
+    nm <- paste0("int_", variable, "_", safe_name(lev))
+
+    data[[nm]] <- as.integer(
+      as.character(data$dibao_group) == "Ever" &
+        as.character(data[[variable]]) == lev
+    )
+
+    int_names <- c(int_names, nm)
+    level_map <- rbind(
+      level_map,
+      data.frame(
+        variable = variable,
+        level = lev,
+        interaction_term = nm,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  list(
+    data = data,
+    interaction_names = int_names,
+    level_map = level_map
+  )
+}
+
+build_formula <- function(interaction_names) {
+  base_covariates <- c(
+    "sex",
+    "income_tertile",
+    "marriage_status",
+    "living_children",
+    "coresident_child"
+  )
+
+  rhs <- c(
+    base_covariates,
+    interaction_names,
+    "strata(age_group, dibao_group)"
+  )
+
+  as.formula(
+    paste(
+      "Surv(start, stop, event) ~",
+      paste(rhs, collapse = " + ")
+    )
+  )
+}
+
+main_coefficient_name <- function(variable, level) {
+  paste0(variable, level)
+}
+
+comparison_label <- function(variable, level) {
+  refs <- c(
+    sex = "Male",
+    income_tertile = "T1",
+    marriage_status = "Partnered",
+    living_children = "0",
+    coresident_child = "No"
+  )
+
+  variable_label <- c(
+    sex = "Sex",
+    income_tertile = "Income",
+    marriage_status = "Marriage",
+    living_children = "Living children",
+    coresident_child = "Coresident child"
+  )
+
+  paste0(
+    variable_label[[variable]], ": ",
+    level, " vs ", refs[[variable]]
+  )
+}
+
+make_level_hr_row <- function(fit, variable, level, interaction_term) {
+  main_term <- main_coefficient_name(variable, level)
+
+  never_stats <- single_coefficient_stats(fit, main_term)
+  ever_stats <- linear_combination_stats(
+    fit,
+    setNames(c(1, 1), c(main_term, interaction_term))
+  )
+  ratio_stats <- single_coefficient_stats(fit, interaction_term)
+
+  never_hr <- stats_to_hr(never_stats)
+  ever_hr <- stats_to_hr(ever_stats)
+  ratio_hr <- stats_to_hr(ratio_stats)
+
+  data.frame(
+    factor = variable,
+    comparison = comparison_label(variable, level),
+    Never_HR = never_hr["HR"],
+    Never_lower_95 = never_hr["lower_95"],
+    Never_upper_95 = never_hr["upper_95"],
+    Never_p = never_hr["p"],
+    Ever_HR = ever_hr["HR"],
+    Ever_lower_95 = ever_hr["lower_95"],
+    Ever_upper_95 = ever_hr["upper_95"],
+    Ever_p = ever_hr["p"],
+    HR_ratio_Ever_vs_Never = ratio_hr["HR"],
+    ratio_lower_95 = ratio_hr["lower_95"],
+    ratio_upper_95 = ratio_hr["upper_95"],
+    interaction_p = ratio_hr["p"],
+    stringsAsFactors = FALSE
+  )
+}
+
+make_readable_interaction <- function(x) {
+  out <- x
+
+  out$Never_HR_95CI <- ifelse(
+    is.na(out$Never_HR),
+    NA_character_,
+    sprintf(
+      "%.3f (%.3f-%.3f)",
+      out$Never_HR, out$Never_lower_95, out$Never_upper_95
+    )
+  )
+
+  out$Ever_HR_95CI <- ifelse(
+    is.na(out$Ever_HR),
+    NA_character_,
+    sprintf(
+      "%.3f (%.3f-%.3f)",
+      out$Ever_HR, out$Ever_lower_95, out$Ever_upper_95
+    )
+  )
+
+  out$HR_ratio_95CI <- ifelse(
+    is.na(out$HR_ratio_Ever_vs_Never),
+    NA_character_,
+    sprintf(
+      "%.3f (%.3f-%.3f)",
+      out$HR_ratio_Ever_vs_Never,
+      out$ratio_lower_95,
+      out$ratio_upper_95
+    )
+  )
+
+  out$interaction_p_display <- ifelse(
+    is.na(out$interaction_p),
+    NA_character_,
+    ifelse(
+      out$interaction_p < 0.001,
+      "<0.001",
+      sprintf("%.3f", out$interaction_p)
+    )
+  )
+
+  out[, c(
+    "factor",
+    "comparison",
+    "Never_HR_95CI",
+    "Ever_HR_95CI",
+    "HR_ratio_95CI",
+    "interaction_p_display",
+    "Never_HR", "Never_lower_95", "Never_upper_95", "Never_p",
+    "Ever_HR", "Ever_lower_95", "Ever_upper_95", "Ever_p",
+    "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+    "interaction_p"
+  )]
+}
+
+make_group_level_qa <- function(data, variable) {
+  levs <- levels(data[[variable]])
+  groups <- levels(data$dibao_group)
+
+  grid <- expand.grid(
+    dibao_group = groups,
+    level = levs,
+    stringsAsFactors = FALSE
+  )
+
+  out <- lapply(seq_len(nrow(grid)), function(i) {
+    gr <- grid$dibao_group[i]
+    lev <- grid$level[i]
+
+    d <- data[
+      as.character(data$dibao_group) == gr &
+        as.character(data[[variable]]) == lev,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      dibao_group = gr,
+      variable = variable,
+      level = lev,
+      records = nrow(d),
+      persons = length(unique(d$individual_id)),
+      events = sum(d$event, na.rm = TRUE),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+check_nonoverlap <- function(data) {
+  ids <- unique(data$individual_id)
+  bad <- character(0)
+
+  for (id in ids) {
+    d <- data[data$individual_id == id, , drop = FALSE]
+    d <- d[order(d$start, d$stop), , drop = FALSE]
+
+    if (nrow(d) > 1) {
+      overlap <- d$start[-1] < d$stop[-nrow(d)]
+      if (any(overlap, na.rm = TRUE)) {
+        bad <- c(bad, id)
+      }
+    }
+  }
+
+  unique(bad)
+}
+
+print_table_section <- function(title, x, digits = 4) {
+  cat("\n", paste(rep("=", 78), collapse = ""), "\n", sep = "")
+  cat(title, "\n")
+  cat(paste(rep("=", 78), collapse = ""), "\n", sep = "")
+
+  if (is.null(x) || nrow(x) == 0) {
+    cat("No result available.\n")
+  } else {
+    print(x, row.names = FALSE, digits = digits)
+  }
+}
+
+add_sheet <- function(wb, name, x) {
+  addWorksheet(wb, name)
+  writeData(wb, name, x)
+}
+
+# ---------------------------
+# 2. Read and validate common Method A data
+# ---------------------------
+common <- readRDS(COMMON_RDS)
+
+required_common_objects <- c(
+  "analysis_intervals",
+  "income_cutoffs"
+)
+
+missing_common_objects <- setdiff(
+  required_common_objects,
+  names(common)
+)
+
+if (length(missing_common_objects) > 0) {
+  stop(
+    "The common RDS is missing required object(s): ",
+    paste(missing_common_objects, collapse = ", ")
+  )
+}
+
+dat_all <- common$analysis_intervals
+
+required_columns <- c(
+  "individual_id",
+  "household_id",
+  "dibao_group",
+  "start",
+  "stop",
+  "event",
+  "person_years",
+  "sex",
+  "income_tertile",
+  "long_mean_household_income_pc",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "age_group"
+)
+
+missing_columns <- setdiff(required_columns, names(dat_all))
+
+if (length(missing_columns) > 0) {
+  stop(
+    "analysis_intervals is missing required column(s): ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+if (length(common$income_cutoffs) != 2 ||
+    any(!is.finite(common$income_cutoffs))) {
+  stop("The common RDS does not contain two valid finite income cutoffs.")
+}
+
+q1 <- as.numeric(common$income_cutoffs[1])
+q2 <- as.numeric(common$income_cutoffs[2])
+
+if (!(q1 < q2)) {
+  stop("Income cutoffs are invalid: q1 must be smaller than q2.")
+}
+
+# Keep only the two formal analysis groups.
+dat_all <- dat_all[
+  as.character(dat_all$dibao_group) %in% c("Never", "Ever"),
+  , drop = FALSE
+]
+
+if (nrow(dat_all) == 0) {
+  stop("No Ever/Never analysis intervals found in the common RDS.")
+}
+
+# Basic person-period integrity checks.
+if (any(is.na(dat_all$start)) || any(is.na(dat_all$stop))) {
+  stop("Interaction data contain missing start or stop times.")
+}
+
+if (any(dat_all$stop <= dat_all$start)) {
+  stop("Interaction data contain stop <= start intervals.")
+}
+
+if (any(!dat_all$event %in% c(0, 1))) {
+  stop("Interaction data contain event values other than 0/1.")
+}
+
+events_per_person <- tapply(
+  dat_all$event,
+  dat_all$individual_id,
+  sum,
+  na.rm = TRUE
+)
+
+if (any(events_per_person > 1)) {
+  stop("At least one participant has more than one death event.")
+}
+
+bad_overlap <- check_nonoverlap(dat_all)
+
+if (length(bad_overlap) > 0) {
+  stop(
+    "Overlapping person-period intervals detected for ",
+    length(bad_overlap),
+    " participant(s). First IDs: ",
+    paste(head(bad_overlap, 10), collapse = ", ")
+  )
+}
+
+# ---------------------------
+# 3. Match the revised Ever/Never model sample definition
+# ---------------------------
+# Marriage Unknown was excluded from BOTH revised separate-group Cox models
+# because it created severe sparse/zero-event instability. The interaction
+# analysis must therefore use the same rule for both groups.
+marriage_unknown_excluded <- dat_all[
+  as.character(dat_all$marriage_status) == "Unknown",
+  , drop = FALSE
+]
+
+dat <- dat_all[
+  as.character(dat_all$marriage_status) != "Unknown",
+  , drop = FALSE
+]
+
+dat <- droplevels(dat)
+
+# Re-assert factor order and reference categories.
+dat$dibao_group <- factor(
+  dat$dibao_group,
+  levels = c("Never", "Ever")
+)
+
+dat$sex <- factor(
+  dat$sex,
+  levels = c("Male", "Female")
+)
+
+dat$income_tertile <- factor(
+  dat$income_tertile,
+  levels = c("T1", "T2", "T3")
+)
+
+dat$marriage_status <- factor(
+  dat$marriage_status,
+  levels = c(
+    "Partnered",
+    "Widowed",
+    "Separated-Divorced",
+    "Never married"
+  )
+)
+
+dat$living_children <- factor(
+  dat$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+
+dat$coresident_child <- factor(
+  dat$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+
+dat$age_group <- factor(
+  dat$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+# Required modeled fields must be present after filtering/re-leveling.
+for (v in c(
+  "dibao_group", "sex", "income_tertile", "marriage_status",
+  "living_children", "coresident_child", "age_group"
+)) {
+  if (any(is.na(dat[[v]]))) {
+    stop("Unexpected missing/invalid value in final interaction variable: ", v)
+  }
+}
+
+if (length(unique(dat$dibao_group)) != 2) {
+  stop("Both Never and Ever groups are required for interaction testing.")
+}
+
+if (sum(dat$event, na.rm = TRUE) == 0) {
+  stop("No death events remain in the interaction analysis data.")
+}
+```
+
+
+```{r}
+# 4. Sample summary and QA
+# ---------------------------
+sample_summary <- do.call(
+  rbind,
+  lapply(c("Never", "Ever"), function(gr) {
+    d <- dat[as.character(dat$dibao_group) == gr, , drop = FALSE]
+
+    data.frame(
+      dibao_group = gr,
+      persons = length(unique(d$individual_id)),
+      households = length(unique(d$household_id)),
+      person_intervals = nrow(d),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      death_events = sum(d$event, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+marriage_unknown_exclusion_summary <- do.call(
+  rbind,
+  lapply(c("Never", "Ever"), function(gr) {
+    d <- marriage_unknown_excluded[
+      as.character(marriage_unknown_excluded$dibao_group) == gr,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      dibao_group = gr,
+      rule = "Marriage status Unknown excluded from formal interaction models",
+      records_excluded = nrow(d),
+      persons_affected = length(unique(d$individual_id)),
+      events_excluded = sum(d$event, na.rm = TRUE),
+      person_years_excluded = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+income_cutoff_table <- data.frame(
+  cutoff = c("33.333%", "66.667%"),
+  value = c(q1, q2),
+  method = "Same Method A common cutoffs generated by revised Ever script",
+  stringsAsFactors = FALSE
+)
+
+qa_variables <- c(
+  "sex",
+  "income_tertile",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "age_group"
+)
+
+cell_qa <- do.call(
+  rbind,
+  lapply(qa_variables, function(v) make_group_level_qa(dat, v))
+)
+
+sparse_qa <- cell_qa[
+  cell_qa$events < MIN_EVENTS_PER_GROUP_LEVEL,
+  , drop = FALSE
+]
+
+# ---------------------------
+# 5. Define primary and sensitivity interaction specifications
+# ---------------------------
+# PRIMARY substantive interaction levels.
+# Unknown missingness categories remain in the adjustment set but are not
+# included in the primary substantive heterogeneity test.
+primary_specs <- list(
+  sex = c("Female"),
+  income_tertile = c("T2", "T3"),
+  marriage_status = c("Widowed", "Separated-Divorced", "Never married"),
+  living_children = c("1", "2", "3+"),
+  coresident_child = c("Yes")
+)
+
+# ALL-LEVEL sensitivity interaction levels.
+# Here Unknown is additionally interacted for children and coresidence.
+all_level_specs <- list(
+  sex = c("Female"),
+  income_tertile = c("T2", "T3"),
+  marriage_status = c("Widowed", "Separated-Divorced", "Never married"),
+  living_children = c("1", "2", "3+", "Unknown"),
+  coresident_child = c("Yes", "Unknown")
+)
+
+# ---------------------------
+# 6. Verify primary interaction cells before fitting
+# ---------------------------
+primary_eligibility <- data.frame()
+
+for (target in names(primary_specs)) {
+  for (lev in primary_specs[[target]]) {
+    z <- cell_qa[
+      cell_qa$variable == target &
+        cell_qa$level == lev &
+        cell_qa$dibao_group %in% c("Never", "Ever"),
+      , drop = FALSE
+    ]
+
+    never_events <- if (any(z$dibao_group == "Never")) {
+      z$events[z$dibao_group == "Never"][1]
+    } else {
+      NA_real_
+    }
+
+    ever_events <- if (any(z$dibao_group == "Ever")) {
+      z$events[z$dibao_group == "Ever"][1]
+    } else {
+      NA_real_
+    }
+
+    eligible <- !is.na(never_events) && !is.na(ever_events) &&
+      never_events >= MIN_EVENTS_PER_GROUP_LEVEL &&
+      ever_events >= MIN_EVENTS_PER_GROUP_LEVEL
+
+    primary_eligibility <- rbind(
+      primary_eligibility,
+      data.frame(
+        factor = target,
+        level = lev,
+        Never_events = never_events,
+        Ever_events = ever_events,
+        eligible = eligible,
+        rule = paste0(
+          ">=", MIN_EVENTS_PER_GROUP_LEVEL,
+          " deaths in both Dibao groups"
+        ),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+if (any(!primary_eligibility$eligible)) {
+  bad <- primary_eligibility[!primary_eligibility$eligible, , drop = FALSE]
+  stop(
+    "At least one PRIMARY substantive interaction level does not meet the ",
+    "prespecified event-count stability rule. Inspect primary_eligibility.\n",
+    paste(
+      paste0(
+        bad$factor, " / ", bad$level,
+        " (Never events=", bad$Never_events,
+        ", Ever events=", bad$Ever_events, ")"
+      ),
+      collapse = "\n"
+    )
+  )
+}
+```
+
+
+```{r}
+# 7. Function to fit one-factor-at-a-time interaction models
+# ---------------------------
+fit_interaction_set <- function(data, specs, analysis_label) {
+  models <- list()
+  block_tests <- data.frame()
+  level_HRs <- data.frame()
+  coefficients <- data.frame()
+  ph_tables <- data.frame()
+  ph_objects <- list()
+  warnings_table <- data.frame()
+
+  for (target in names(specs)) {
+    tmp <- add_interaction_columns(
+      data,
+      target,
+      specs[[target]]
+    )
+
+    model_data <- tmp$data
+    int_names <- tmp$interaction_names
+    level_map <- tmp$level_map
+    form <- build_formula(int_names)
+
+    fit_obj <- fit_cox_with_warnings(form, model_data)
+    fit <- fit_obj$fit
+
+    model_name <- paste0(analysis_label, "_", target)
+    models[[target]] <- fit
+
+    # Robust block Wald test: H0 = all interaction coefficients for target = 0.
+    block <- wald_block(fit, int_names)
+    block$analysis <- analysis_label
+    block$factor <- target
+    block$n_interaction_terms <- length(int_names)
+
+    block_tests <- rbind(
+      block_tests,
+      block[, c(
+        "analysis", "factor", "chisq", "df", "p_value",
+        "n_interaction_terms", "status"
+      )]
+    )
+
+    # All model coefficients.
+    cc <- extract_cox_results(fit)
+    cc$analysis <- analysis_label
+    cc$factor_tested <- target
+
+    coefficients <- rbind(
+      coefficients,
+      cc[, c(
+        "analysis", "factor_tested",
+        setdiff(names(cc), c("analysis", "factor_tested"))
+      )]
+    )
+
+    # Level-specific Never HR, Ever HR, and Ever/Never HR ratio.
+    for (j in seq_len(nrow(level_map))) {
+      rr <- make_level_hr_row(
+        fit = fit,
+        variable = target,
+        level = level_map$level[j],
+        interaction_term = level_map$interaction_term[j]
+      )
+      rr$analysis <- analysis_label
+
+      level_HRs <- rbind(
+        level_HRs,
+        rr[, c("analysis", setdiff(names(rr), "analysis"))]
+      )
+    }
+
+    # PH diagnostics.
+    ph_diag <- run_ph_diagnostic(
+      form,
+      model_data,
+      fit,
+      model_name
+    )
+
+    ph_objects[[target]] <- ph_diag$object
+    ph_tables <- rbind(ph_tables, ph_diag$table)
+
+    # Capture coxph warnings.
+    if (length(fit_obj$warnings) > 0) {
+      warnings_table <- rbind(
+        warnings_table,
+        data.frame(
+          analysis = analysis_label,
+          model = target,
+          warning = fit_obj$warnings,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+
+  list(
+    models = models,
+    block_tests = block_tests,
+    level_HRs = level_HRs,
+    coefficients = coefficients,
+    ph_tables = ph_tables,
+    ph_objects = ph_objects,
+    warnings = warnings_table
+  )
+}
+
+# ---------------------------
+# 8. PRIMARY one-factor-at-a-time substantive interaction models
+# ---------------------------
+primary_results <- fit_interaction_set(
+  data = dat,
+  specs = primary_specs,
+  analysis_label = "Primary_Substantive"
+)
+
+primary_level_readable <- make_readable_interaction(
+  primary_results$level_HRs
+)
+
+# ---------------------------
+# 9. ALL-LEVEL one-factor-at-a-time sensitivity models
+# ---------------------------
+all_level_results <- fit_interaction_set(
+  data = dat,
+  specs = all_level_specs,
+  analysis_label = "Sensitivity_AllLevels"
+)
+
+all_level_readable <- make_readable_interaction(
+  all_level_results$level_HRs
+)
+
+# ---------------------------
+# 10. Full interaction model helper
+# ---------------------------
+fit_full_interaction_model <- function(data, specs, analysis_label) {
+  full_data <- data
+  full_blocks <- list()
+  full_level_map <- list()
+  all_interaction_names <- character(0)
+
+  for (target in names(specs)) {
+    tmp <- add_interaction_columns(
+      full_data,
+      target,
+      specs[[target]]
+    )
+
+    full_data <- tmp$data
+    full_blocks[[target]] <- tmp$interaction_names
+    full_level_map[[target]] <- tmp$level_map
+    all_interaction_names <- c(
+      all_interaction_names,
+      tmp$interaction_names
+    )
+  }
+
+  full_formula <- build_formula(all_interaction_names)
+  fit_obj <- fit_cox_with_warnings(full_formula, full_data)
+  fit <- fit_obj$fit
+
+  block_tests <- data.frame()
+  level_HRs <- data.frame()
+
+  for (target in names(specs)) {
+    int_names <- full_blocks[[target]]
+    block <- wald_block(fit, int_names)
+    block$analysis <- analysis_label
+    block$factor <- target
+    block$n_interaction_terms <- length(int_names)
+
+    block_tests <- rbind(
+      block_tests,
+      block[, c(
+        "analysis", "factor", "chisq", "df", "p_value",
+        "n_interaction_terms", "status"
+      )]
+    )
+
+    lm <- full_level_map[[target]]
+
+    for (j in seq_len(nrow(lm))) {
+      rr <- make_level_hr_row(
+        fit = fit,
+        variable = target,
+        level = lm$level[j],
+        interaction_term = lm$interaction_term[j]
+      )
+      rr$analysis <- analysis_label
+
+      level_HRs <- rbind(
+        level_HRs,
+        rr[, c("analysis", setdiff(names(rr), "analysis"))]
+      )
+    }
+  }
+
+  coefficients <- extract_cox_results(fit)
+  coefficients$analysis <- analysis_label
+  coefficients <- coefficients[, c(
+    "analysis", setdiff(names(coefficients), "analysis")
+  )]
+
+  ph_diag <- run_ph_diagnostic(
+    full_formula,
+    full_data,
+    fit,
+    analysis_label
+  )
+
+  warning_table <- if (length(fit_obj$warnings) > 0) {
+    data.frame(
+      analysis = analysis_label,
+      model = "Full interaction model",
+      warning = fit_obj$warnings,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame()
+  }
+
+  list(
+    model = fit,
+    formula = full_formula,
+    block_tests = block_tests,
+    level_HRs = level_HRs,
+    level_HRs_readable = make_readable_interaction(level_HRs),
+    coefficients = coefficients,
+    ph = ph_diag$object,
+    ph_table = ph_diag$table,
+    warnings = warning_table
+  )
+}
+```
+
+
+```{r}
+# 11. Full substantive interaction sensitivity model
+# ---------------------------
+full_substantive <- fit_full_interaction_model(
+  data = dat,
+  specs = primary_specs,
+  analysis_label = "Full_Substantive"
+)
+
+# ---------------------------
+# 12. Full all-level sensitivity model
+# ---------------------------
+full_all_levels <- fit_full_interaction_model(
+  data = dat,
+  specs = all_level_specs,
+  analysis_label = "Full_AllLevels"
+)
+
+# ---------------------------
+# 13. Interaction-cell QA and sensitivity flags
+# ---------------------------
+# The all-level sensitivity model may contain low-event Unknown categories.
+# Flag them explicitly; do not silently interpret them as stable substantive
+# effects.
+all_level_interaction_qa <- data.frame()
+
+for (target in names(all_level_specs)) {
+  for (lev in all_level_specs[[target]]) {
+    z <- cell_qa[
+      cell_qa$variable == target &
+        cell_qa$level == lev &
+        cell_qa$dibao_group %in% c("Never", "Ever"),
+      , drop = FALSE
+    ]
+
+    never_events <- if (any(z$dibao_group == "Never")) {
+      z$events[z$dibao_group == "Never"][1]
+    } else {
+      NA_real_
+    }
+
+    ever_events <- if (any(z$dibao_group == "Ever")) {
+      z$events[z$dibao_group == "Ever"][1]
+    } else {
+      NA_real_
+    }
+
+    all_level_interaction_qa <- rbind(
+      all_level_interaction_qa,
+      data.frame(
+        factor = target,
+        level = lev,
+        Never_events = never_events,
+        Ever_events = ever_events,
+        low_event_flag =
+          is.na(never_events) || is.na(ever_events) ||
+          never_events < MIN_EVENTS_PER_GROUP_LEVEL ||
+          ever_events < MIN_EVENTS_PER_GROUP_LEVEL,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# ---------------------------
+# 14. Side-by-side independent group results (descriptive only)
+# ---------------------------
+# These are NOT the formal interaction results. They are included only to help
+# the reader compare the separately fitted Ever and Never main Cox models.
+independent_group_comparison <- data.frame()
+
+if (!is.null(ever_results_object) &&
+    !is.null(ever_results_object$main_results_readable) &&
+    !is.null(never_results_object$main_results_readable)) {
+
+  ev <- ever_results_object$main_results_readable
+  nv <- never_results_object$main_results_readable
+
+  ev2 <- ev[, c("comparison", "HR", "lower_95", "upper_95", "p_value")]
+  nv2 <- nv[, c("comparison", "HR", "lower_95", "upper_95", "p_value")]
+
+  names(ev2)[-1] <- paste0("Ever_", names(ev2)[-1])
+  names(nv2)[-1] <- paste0("Never_", names(nv2)[-1])
+
+  independent_group_comparison <- merge(
+    nv2,
+    ev2,
+    by = "comparison",
+    all = TRUE,
+    sort = FALSE
+  )
+}
+
+# ---------------------------
+# 15. Combine warnings
+# ---------------------------
+model_warning_table <- rbind(
+  primary_results$warnings,
+  all_level_results$warnings,
+  full_substantive$warnings,
+  full_all_levels$warnings
+)
+
+if (nrow(model_warning_table) == 0) {
+  model_warning_table <- data.frame(
+    analysis = "None",
+    model = "None",
+    warning = "No coxph warnings captured",
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------
+# 16. PH diagnostic PDFs
+# ---------------------------
+# One PDF for each PRIMARY substantive interaction model.
+for (target in names(primary_results$models)) {
+  ph <- primary_results$ph_objects[[target]]
+
+  if (!inherits(ph, "cox_zph_error")) {
+    pdf(file.path(
+      OUTPUT_DIR,
+      paste0("A_Interaction_PH_Primary_", safe_name(target), ".pdf")
+    ))
+    try(plot(ph), silent = TRUE)
+    dev.off()
+  }
+}
+
+if (!inherits(full_substantive$ph, "cox_zph_error")) {
+  pdf(file.path(OUTPUT_DIR, "A_Interaction_PH_Full_Substantive.pdf"))
+  try(plot(full_substantive$ph), silent = TRUE)
+  dev.off()
+}
+
+if (!inherits(full_all_levels$ph, "cox_zph_error")) {
+  pdf(file.path(OUTPUT_DIR, "A_Interaction_PH_Full_AllLevels.pdf"))
+  try(plot(full_all_levels$ph), silent = TRUE)
+  dev.off()
+}
+```
+
+
+```{r}
+# 17. Save R model/results object
+# ---------------------------
+saveRDS(
+  list(
+    method = "Method A revised Ever-vs-Never interaction analysis",
+    common_rds = COMMON_RDS,
+    income_cutoffs = c(q1 = q1, q2 = q2),
+    interaction_model_data = dat,
+    sample_summary = sample_summary,
+    marriage_unknown_exclusion = marriage_unknown_exclusion_summary,
+    cell_qa = cell_qa,
+    sparse_qa = sparse_qa,
+    primary_eligibility = primary_eligibility,
+    all_level_interaction_qa = all_level_interaction_qa,
+    primary_models = primary_results$models,
+    primary_block_tests = primary_results$block_tests,
+    primary_level_HRs = primary_results$level_HRs,
+    primary_coefficients = primary_results$coefficients,
+    primary_ph = primary_results$ph_tables,
+    all_level_models = all_level_results$models,
+    all_level_block_tests = all_level_results$block_tests,
+    all_level_level_HRs = all_level_results$level_HRs,
+    all_level_coefficients = all_level_results$coefficients,
+    all_level_ph = all_level_results$ph_tables,
+    full_substantive = full_substantive,
+    full_all_levels = full_all_levels,
+    independent_group_comparison = independent_group_comparison,
+    warnings = model_warning_table
+  ),
+  file.path(
+    OUTPUT_DIR,
+    "A_Dibao_interaction_models_and_results_revised.rds"
+  )
+)
+
+# ---------------------------
+# 18. Excel workbook
+# ---------------------------
+wb <- createWorkbook()
+
+add_sheet(wb, "Sample_Summary", sample_summary)
+add_sheet(wb, "Tertile_Cutoffs", income_cutoff_table)
+add_sheet(wb, "Marriage_Unknown_Excl", marriage_unknown_exclusion_summary)
+add_sheet(wb, "Primary_Eligibility", primary_eligibility)
+add_sheet(wb, "Primary_Block", primary_results$block_tests)
+add_sheet(wb, "Primary_Level_HRs", primary_level_readable)
+add_sheet(wb, "Primary_Coeff", primary_results$coefficients)
+add_sheet(wb, "Primary_PH", primary_results$ph_tables)
+add_sheet(wb, "AllLevel_Block", all_level_results$block_tests)
+add_sheet(wb, "AllLevel_Level_HRs", all_level_readable)
+add_sheet(wb, "AllLevel_Coeff", all_level_results$coefficients)
+add_sheet(wb, "AllLevel_PH", all_level_results$ph_tables)
+add_sheet(wb, "FullSub_Block", full_substantive$block_tests)
+add_sheet(wb, "FullSub_Level_HRs", full_substantive$level_HRs_readable)
+add_sheet(wb, "FullSub_Coeff", full_substantive$coefficients)
+add_sheet(wb, "FullSub_PH", full_substantive$ph_table)
+add_sheet(wb, "FullAll_Block", full_all_levels$block_tests)
+add_sheet(wb, "FullAll_Level_HRs", full_all_levels$level_HRs_readable)
+add_sheet(wb, "FullAll_Coeff", full_all_levels$coefficients)
+add_sheet(wb, "FullAll_PH", full_all_levels$ph_table)
+add_sheet(wb, "Cell_QA", cell_qa)
+add_sheet(wb, "Sparse_QA", sparse_qa)
+add_sheet(wb, "AllLevel_Interaction_QA", all_level_interaction_qa)
+add_sheet(wb, "Independent_Group_HRs", independent_group_comparison)
+add_sheet(wb, "Model_Warnings", model_warning_table)
+
+saveWorkbook(
+  wb,
+  file.path(OUTPUT_DIR, "A_Dibao_Interaction_results_revised.xlsx"),
+  overwrite = TRUE
+)
+
+# ---------------------------
+# 19. CSV exports
+# ---------------------------
+write.csv(
+  primary_results$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Primary_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  primary_level_readable,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Primary_Level_HRs.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  primary_results$ph_tables,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Primary_PH.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  all_level_results$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_AllLevel_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  all_level_readable,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_AllLevel_Level_HRs.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  full_substantive$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_FullSub_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  full_substantive$level_HRs_readable,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_FullSub_Level_HRs.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  full_all_levels$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_FullAll_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  cell_qa,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Cell_QA.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sparse_qa,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Sparse_QA.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  model_warning_table,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Model_Warnings.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(OUTPUT_DIR, "A_Interaction_sessionInfo.txt")
+)
+
+# ---------------------------
+# 20. Directly show the most important results in R / RStudio
+# ---------------------------
+print_table_section(
+  "METHOD A - EVER VS NEVER: INTERACTION ANALYSIS SAMPLE",
+  sample_summary
+)
+
+print_table_section(
+  "MARRIAGE UNKNOWN EXCLUSION QA",
+  marriage_unknown_exclusion_summary
+)
+
+print_table_section(
+  "PRIMARY SUBSTANTIVE INTERACTION ELIGIBILITY",
+  primary_eligibility
+)
+
+print_table_section(
+  "PRIMARY SUBSTANTIVE BLOCK INTERACTION TESTS",
+  primary_results$block_tests
+)
+
+print_table_section(
+  "PRIMARY LEVEL-SPECIFIC HRs AND EVER/NEVER HR RATIOS",
+  primary_level_readable[, c(
+    "factor",
+    "comparison",
+    "Never_HR_95CI",
+    "Ever_HR_95CI",
+    "HR_ratio_95CI",
+    "interaction_p_display"
+  )]
+)
+
+# Show only GLOBAL PH rows in the console for compactness.
+primary_ph_global <- primary_results$ph_tables[
+  primary_results$ph_tables$term == "GLOBAL" |
+    primary_results$ph_tables$term == "PH_TEST_ERROR",
+  , drop = FALSE
+]
+
+print_table_section(
+  "PRIMARY INTERACTION MODELS - GLOBAL PH DIAGNOSTICS",
+  primary_ph_global
+)
+
+print_table_section(
+  "ALL-LEVEL SENSITIVITY BLOCK TESTS",
+  all_level_results$block_tests
+)
+
+print_table_section(
+  "ALL-LEVEL INTERACTION CELL QA",
+  all_level_interaction_qa
+)
+
+print_table_section(
+  "FULL SUBSTANTIVE INTERACTION MODEL - BLOCK TESTS",
+  full_substantive$block_tests
+)
+
+print_table_section(
+  "FULL ALL-LEVEL INTERACTION MODEL - BLOCK TESTS",
+  full_all_levels$block_tests
+)
+
+print_table_section(
+  "MODEL WARNINGS",
+  model_warning_table
+)
+
+# Optional RStudio data viewers.
+if (interactive()) {
+  View(
+    primary_results$block_tests,
+    title = "Dibao Interaction - Primary Block Tests"
+  )
+
+  View(
+    primary_level_readable,
+    title = "Dibao Interaction - Primary Level HRs"
+  )
+
+  View(
+    primary_results$ph_tables,
+    title = "Dibao Interaction - Primary PH Diagnostics"
+  )
+}
+
+cat("\n", paste(rep("=", 78), collapse = ""), "\n", sep = "")
+cat("Method A - revised Ever vs Never interaction analysis completed.\n")
+cat(
+  "Main workbook: ",
+  file.path(OUTPUT_DIR, "A_Dibao_Interaction_results_revised.xlsx"),
+  "\n",
+  sep = ""
+)
+cat(
+  "Main RDS: ",
+  file.path(OUTPUT_DIR, "A_Dibao_interaction_models_and_results_revised.rds"),
+  "\n",
+  sep = ""
+)
+cat("PRIMARY inference should use Primary_Block + Primary_Level_HRs.\n")
+cat("AllLevel and Full models are sensitivity analyses.\n")
+cat(paste(rep("=", 78), collapse = ""), "\n", sep = "")
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Method A: Ever-vs-Never Dibao interaction analysis, including HUKOU.
+# HUKOU: 1=agricultural; 2=non-agricultural (reference).
+# Fixed at each participant's first non-missing wave in the common RDS.
+# Uses the ALREADY generated Phase 1 common + group model RDS files.
+# Run from the same working directory as Phase 1; no CSV reread/cleaning.
+# Formal models are not executed by preparing this script.
+
+# 0. Settings
+# ---------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "A_Cox_outputs")
+COMMON_RDS <- file.path(OUTPUT_DIR, "A_Cox_common_data.rds")
+EVER_RESULTS_RDS <- file.path(OUTPUT_DIR, "A_Ever_models_and_results.rds")
+NEVER_RESULTS_RDS <- file.path(OUTPUT_DIR, "A_Never_models_and_results.rds")
+
+# Stability threshold for PRIMARY substantive interaction levels.
+# Every non-reference level in a primary interaction must have at least this
+# many deaths in BOTH Dibao groups. The current dataset satisfies this for all
+# primary substantive levels. This rule prevents zero-event/quasi-separation
+# from silently entering a formal primary interaction test.
+MIN_EVENTS_PER_GROUP_LEVEL <- 5L
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "csv"), showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+
+options(stringsAsFactors = FALSE)
+
+if (!file.exists(COMMON_RDS)) {
+  stop(
+    "A_Cox_common_data.rds was not found at: ", COMMON_RDS, "\n",
+    "Run the updated Ever Dibao HUKOU script to create it first."
+  )
+}
+
+if (!file.exists(EVER_RESULTS_RDS)) {
+  stop(
+    "A_Ever_models_and_results.rds was not found at: ", EVER_RESULTS_RDS,
+    "\nThe updated Ever Dibao HUKOU model RDS is required."
+  )
+}
+
+if (!file.exists(NEVER_RESULTS_RDS)) {
+  stop(
+    "A_Never_models_and_results.rds was not found at: ", NEVER_RESULTS_RDS,
+    "\nThe updated Never Dibao HUKOU model RDS is required."
+  )
+}
+
+# The interaction model itself uses the common RDS for formal estimation.
+# The two group-specific RDS files are also loaded only to export a descriptive
+# side-by-side comparison of the already-fitted separate-group main Cox models.
+ever_results_object <- readRDS(EVER_RESULTS_RDS)
+never_results_object <- readRDS(NEVER_RESULTS_RDS)
+
+# Reject old Phase 1 model results that predate the HUKOU adjustment.
+for (group_object in list(
+  Ever = ever_results_object,
+  Never = never_results_object
+)) {
+  if (is.null(group_object$main_model) ||
+      is.null(group_object$main_results) ||
+      is.null(group_object$main_results_readable) ||
+      !("hukouAgricultural" %in% group_object$main_results$term)) {
+    stop(
+      "A Phase 1 result RDS is missing the adjusted HUKOU main model. ",
+      "Use the already generated NEW Ever/Never HUKOU RDS files."
+    )
+  }
+}
+
+# 1. Helper functions
+# ---------------------------
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  list(
+    fit = fit,
+    warnings = unique(warnings_seen)
+  )
+}
+
+extract_cox_results <- function(fit) {
+  s <- summary(fit)
+  coef_table <- as.data.frame(s$coefficients)
+  ci_table <- as.data.frame(s$conf.int)
+
+  out <- data.frame(
+    term = rownames(coef_table),
+    beta = coef_table[, "coef"],
+    HR = ci_table[, "exp(coef)"],
+    lower_95 = ci_table[, "lower .95"],
+    upper_95 = ci_table[, "upper .95"],
+    p_value = coef_table[, "Pr(>|z|)"],
+    row.names = NULL,
+    check.names = FALSE
+  )
+
+  if ("robust se" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "robust se"]
+  } else if ("se(coef)" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "se(coef)"]
+  } else {
+    out$robust_se <- NA_real_
+  }
+
+  out[, c(
+    "term", "beta", "robust_se", "HR",
+    "lower_95", "upper_95", "p_value"
+  )]
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(
+      fit,
+      transform = "km",
+      terms = TRUE,
+      global = TRUE
+    ),
+    error = function(e) {
+      structure(
+        list(message = conditionMessage(e)),
+        class = "cox_zph_error"
+      )
+    }
+  )
+}
+
+ph_table <- function(ph_object, model_name) {
+  if (inherits(ph_object, "cox_zph_error")) {
+    return(data.frame(
+      model = model_name,
+      term = "PH_TEST_ERROR",
+      chisq = NA_real_,
+      df = NA_real_,
+      p = NA_real_,
+      message = ph_object$message,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  x <- as.data.frame(ph_object$table)
+  x$term <- rownames(x)
+  x$model <- model_name
+  x$message <- NA_character_
+  rownames(x) <- NULL
+
+  x[, c(
+    "model", "term",
+    setdiff(names(x), c("model", "term"))
+  ), drop = FALSE]
+}
+
+# PH diagnostic strategy:
+# 1) run cox.zph() on the formal clustered-robust Cox fit;
+# 2) only if the robust fit is computationally singular for cox.zph(),
+#    fit the exact same Cox formula without cluster/robust variance solely for
+#    PH diagnostics. The fallback does NOT replace the formal interaction HRs.
+run_ph_diagnostic <- function(formula, data, clustered_fit, model_name) {
+  primary <- safe_cox_zph(clustered_fit)
+
+  if (!inherits(primary, "cox_zph_error")) {
+    tab <- ph_table(primary, model_name)
+    tab$diagnostic_source <- "clustered robust Cox fit"
+    tab$primary_error <- NA_character_
+
+    return(list(
+      object = primary,
+      table = tab,
+      source = "clustered robust Cox fit",
+      primary_error = NA_character_
+    ))
+  }
+
+  diagnostic_fit <- tryCatch(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      x = TRUE,
+      model = TRUE
+    ),
+    error = function(e) e
+  )
+
+  fallback <- if (inherits(diagnostic_fit, "error")) {
+    structure(list(message = conditionMessage(diagnostic_fit)),
+              class = "cox_zph_error")
+  } else {
+    safe_cox_zph(diagnostic_fit)
+  }
+  tab <- ph_table(fallback, model_name)
+  tab$diagnostic_source <- "same formula, unclustered diagnostic fallback"
+  tab$primary_error <- primary$message
+
+  list(
+    object = fallback,
+    table = tab,
+    source = "same formula, unclustered diagnostic fallback",
+    primary_error = primary$message
+  )
+}
+
+# Robust joint Wald test for a block of interaction coefficients.
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_,
+      status = "No coefficients found"
+    ))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = length(coefficient_names),
+      p_value = NA_real_,
+      status = "Non-finite coefficient/variance; inspect sparse cells"
+    ))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_,
+      status = "Robust covariance block has rank 0"
+    ))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+  p <- pchisq(W, df = df, lower.tail = FALSE)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = p,
+    status = ifelse(
+      df < length(coefficient_names),
+      "Reduced-rank robust Wald test",
+      "OK"
+    )
+  )
+}
+
+single_coefficient_stats <- function(fit, term) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  if (!(term %in% names(b)) || !is.finite(b[term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  if (!is.finite(V[term, term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  est <- unname(b[term])
+  se <- sqrt(V[term, term])
+  p <- 2 * pnorm(abs(est / se), lower.tail = FALSE)
+
+  c(est = est, se = se, p = p)
+}
+
+linear_combination_stats <- function(fit, weights) {
+  b <- coef(fit)
+  V <- vcov(fit)
+  needed <- names(weights)
+
+  if (any(!(needed %in% names(b)))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  if (any(!is.finite(b[needed])) ||
+      any(!is.finite(V[needed, needed, drop = FALSE]))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  w <- rep(0, length(b))
+  names(w) <- names(b)
+  w[needed] <- weights
+
+  est <- sum(w * b)
+  se <- sqrt(as.numeric(t(w) %*% V %*% w))
+  p <- 2 * pnorm(abs(est / se), lower.tail = FALSE)
+
+  c(est = est, se = se, p = p)
+}
+
+stats_to_hr <- function(stats) {
+  est <- unname(stats["est"])
+  se <- unname(stats["se"])
+  p <- unname(stats["p"])
+
+  if (!is.finite(est) || !is.finite(se)) {
+    return(c(
+      HR = NA_real_, lower_95 = NA_real_, upper_95 = NA_real_, p = NA_real_
+    ))
+  }
+
+  c(
+    HR = exp(est),
+    lower_95 = exp(est - 1.96 * se),
+    upper_95 = exp(est + 1.96 * se),
+    p = p
+  )
+}
+
+safe_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("_+$", "", x)
+  x
+}
+
+add_interaction_columns <- function(data, variable, levels_to_interact) {
+  int_names <- character(0)
+  level_map <- data.frame(
+    variable = character(0),
+    level = character(0),
+    interaction_term = character(0),
+    stringsAsFactors = FALSE
+  )
+
+  for (lev in levels_to_interact) {
+    nm <- paste0("int_", variable, "_", safe_name(lev))
+
+    data[[nm]] <- as.integer(
+      as.character(data$dibao_group) == "Ever" &
+        as.character(data[[variable]]) == lev
+    )
+
+    int_names <- c(int_names, nm)
+    level_map <- rbind(
+      level_map,
+      data.frame(
+        variable = variable,
+        level = lev,
+        interaction_term = nm,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  list(
+    data = data,
+    interaction_names = int_names,
+    level_map = level_map
+  )
+}
+
+build_formula <- function(interaction_names) {
+  # All six Phase 1 factors are adjusted in EVERY pooled model.
+  base_covariates <- c(
+    "sex",
+    "income_tertile",
+    "marriage_status",
+    "living_children",
+    "coresident_child",
+    "hukou"
+  )
+
+  rhs <- c(
+    base_covariates,
+    interaction_names,
+    "strata(age_group, dibao_group)"
+  )
+
+  as.formula(
+    paste(
+      "Surv(start, stop, event) ~",
+      paste(rhs, collapse = " + ")
+    )
+  )
+}
+
+main_coefficient_name <- function(variable, level) {
+  paste0(variable, level)
+}
+
+comparison_label <- function(variable, level) {
+  refs <- c(
+    sex = "Male",
+    income_tertile = "T1",
+    marriage_status = "Partnered",
+    living_children = "0",
+    coresident_child = "No",
+    hukou = "Non-agricultural"
+  )
+
+  variable_label <- c(
+    sex = "Sex",
+    income_tertile = "Income",
+    marriage_status = "Marriage",
+    living_children = "Living children",
+    coresident_child = "Coresident child",
+    hukou = "HUKOU"
+  )
+
+  paste0(
+    variable_label[[variable]], ": ",
+    level, " vs ", refs[[variable]]
+  )
+}
+
+make_level_hr_row <- function(fit, variable, level, interaction_term) {
+  main_term <- main_coefficient_name(variable, level)
+
+  never_stats <- single_coefficient_stats(fit, main_term)
+  ever_stats <- linear_combination_stats(
+    fit,
+    setNames(c(1, 1), c(main_term, interaction_term))
+  )
+  ratio_stats <- single_coefficient_stats(fit, interaction_term)
+
+  never_hr <- stats_to_hr(never_stats)
+  ever_hr <- stats_to_hr(ever_stats)
+  ratio_hr <- stats_to_hr(ratio_stats)
+
+  data.frame(
+    factor = variable,
+    comparison = comparison_label(variable, level),
+    Never_HR = never_hr["HR"],
+    Never_lower_95 = never_hr["lower_95"],
+    Never_upper_95 = never_hr["upper_95"],
+    Never_p = never_hr["p"],
+    Ever_HR = ever_hr["HR"],
+    Ever_lower_95 = ever_hr["lower_95"],
+    Ever_upper_95 = ever_hr["upper_95"],
+    Ever_p = ever_hr["p"],
+    HR_ratio_Ever_vs_Never = ratio_hr["HR"],
+    ratio_lower_95 = ratio_hr["lower_95"],
+    ratio_upper_95 = ratio_hr["upper_95"],
+    interaction_p = ratio_hr["p"],
+    stringsAsFactors = FALSE
+  )
+}
+
+make_readable_interaction <- function(x) {
+  out <- x
+
+  out$Never_HR_95CI <- ifelse(
+    is.na(out$Never_HR),
+    NA_character_,
+    sprintf(
+      "%.3f (%.3f-%.3f)",
+      out$Never_HR, out$Never_lower_95, out$Never_upper_95
+    )
+  )
+
+  out$Ever_HR_95CI <- ifelse(
+    is.na(out$Ever_HR),
+    NA_character_,
+    sprintf(
+      "%.3f (%.3f-%.3f)",
+      out$Ever_HR, out$Ever_lower_95, out$Ever_upper_95
+    )
+  )
+
+  out$HR_ratio_95CI <- ifelse(
+    is.na(out$HR_ratio_Ever_vs_Never),
+    NA_character_,
+    sprintf(
+      "%.3f (%.3f-%.3f)",
+      out$HR_ratio_Ever_vs_Never,
+      out$ratio_lower_95,
+      out$ratio_upper_95
+    )
+  )
+
+  out$interaction_p_display <- ifelse(
+    is.na(out$interaction_p),
+    NA_character_,
+    ifelse(
+      out$interaction_p < 0.001,
+      "<0.001",
+      sprintf("%.3f", out$interaction_p)
+    )
+  )
+
+  out[, c(
+    "factor",
+    "comparison",
+    "Never_HR_95CI",
+    "Ever_HR_95CI",
+    "HR_ratio_95CI",
+    "interaction_p_display",
+    "Never_HR", "Never_lower_95", "Never_upper_95", "Never_p",
+    "Ever_HR", "Ever_lower_95", "Ever_upper_95", "Ever_p",
+    "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+    "interaction_p"
+  )]
+}
+
+make_group_level_qa <- function(data, variable) {
+  levs <- levels(data[[variable]])
+  groups <- levels(data$dibao_group)
+
+  grid <- expand.grid(
+    dibao_group = groups,
+    level = levs,
+    stringsAsFactors = FALSE
+  )
+
+  out <- lapply(seq_len(nrow(grid)), function(i) {
+    gr <- grid$dibao_group[i]
+    lev <- grid$level[i]
+
+    d <- data[
+      as.character(data$dibao_group) == gr &
+        as.character(data[[variable]]) == lev,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      dibao_group = gr,
+      variable = variable,
+      level = lev,
+      records = nrow(d),
+      persons = length(unique(d$individual_id)),
+      events = sum(d$event, na.rm = TRUE),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+check_nonoverlap <- function(data) {
+  # Compare only neighboring periods of the SAME respondent after sorting.
+  # This has the same overlap rule as the original, without a full-table scan
+  # for every individual.
+  d <- data[order(as.character(data$individual_id), data$start, data$stop),
+            , drop = FALSE]
+  n <- nrow(d)
+  if (n <= 1L) return(character(0))
+  id <- as.character(d$individual_id)
+  bad <- id[-1L] == id[-n] & d$start[-1L] < d$stop[-n]
+  unique(id[-1L][bad])
+}
+
+print_table_section <- function(title, x, digits = 4) {
+  cat("\n", paste(rep("=", 78), collapse = ""), "\n", sep = "")
+  cat(title, "\n")
+  cat(paste(rep("=", 78), collapse = ""), "\n", sep = "")
+
+  if (is.null(x) || nrow(x) == 0) {
+    cat("No result available.\n")
+  } else {
+    print(x, row.names = FALSE, digits = digits)
+  }
+}
+
+add_sheet <- function(wb, name, x) {
+  addWorksheet(wb, name)
+  writeData(wb, name, x)
+}
+
+# ---------------------------
+# 2. Read and validate common Method A data (including first-valid HUKOU)
+# ---------------------------
+common <- readRDS(COMMON_RDS)
+
+required_common_objects <- c(
+  "analysis_intervals",
+  "income_cutoffs",
+  "hukou_qa"
+)
+
+missing_common_objects <- setdiff(
+  required_common_objects,
+  names(common)
+)
+
+if (length(missing_common_objects) > 0) {
+  stop(
+    "The common RDS is missing required object(s): ",
+    paste(missing_common_objects, collapse = ", ")
+  )
+}
+
+dat_all <- common$analysis_intervals
+
+required_columns <- c(
+  "individual_id",
+  "household_id",
+  "dibao_group",
+  "start",
+  "stop",
+  "event",
+  "person_years",
+  "sex",
+  "income_tertile",
+  "long_mean_household_income_pc",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "hukou",
+  "hukou_fixed",
+  "hukou_first_wave",
+  "hukou_conflict",
+  "age_group"
+)
+
+missing_columns <- setdiff(required_columns, names(dat_all))
+
+if (length(missing_columns) > 0) {
+  stop(
+    "analysis_intervals is missing required column(s): ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+# The updated common RDS stores the HUKOU code and the first-valid wave.
+# Validate these fields without altering any Phase 1 cleaning or cutoffs.
+raw_hukou <- dat_all$hukou_fixed
+if (any(!is.na(raw_hukou) & !(raw_hukou %in% c(1, 2)))) {
+  stop("HUKOU raw coding must be 1 (agricultural) or 2 (non-agricultural).")
+}
+expected_hukou <- ifelse(
+  is.na(raw_hukou), NA_character_,
+  ifelse(raw_hukou == 1, "Agricultural", "Non-agricultural")
+)
+if (!identical(as.character(dat_all$hukou), expected_hukou)) {
+  stop("The common RDS HUKOU labels do not match the latest Phase 1 coding.")
+}
+if (any(is.na(raw_hukou) != is.na(dat_all$hukou_first_wave))) {
+  stop("HUKOU first-valid-wave and missingness fields are inconsistent.")
+}
+if (any(!is.na(dat_all$hukou_first_wave) &
+        !(dat_all$hukou_first_wave %in% c(2011, 2013, 2015, 2018, 2020)))) {
+  stop("Unexpected first-valid HUKOU wave in the common RDS.")
+}
+
+# HUKOU is respondent-fixed, even when it changes in later survey waves.
+by_person_hukou <- tapply(
+  as.character(dat_all$hukou), as.character(dat_all$individual_id),
+  function(x) length(unique(x[!is.na(x)]))
+)
+if (any(by_person_hukou > 1L)) {
+  stop("HUKOU differs across intervals for the same respondent.")
+}
+
+if (length(common$income_cutoffs) != 2 ||
+    any(!is.finite(common$income_cutoffs))) {
+  stop("The common RDS does not contain two valid finite income cutoffs.")
+}
+
+q1 <- as.numeric(common$income_cutoffs[1])
+q2 <- as.numeric(common$income_cutoffs[2])
+
+if (!(q1 < q2)) {
+  stop("Income cutoffs are invalid: q1 must be smaller than q2.")
+}
+
+# Keep only the two formal analysis groups.
+dat_all <- dat_all[
+  as.character(dat_all$dibao_group) %in% c("Never", "Ever"),
+  , drop = FALSE
+]
+
+if (nrow(dat_all) == 0) {
+  stop("No Ever/Never analysis intervals found in the common RDS.")
+}
+
+# Basic person-period integrity checks.
+if (any(is.na(dat_all$start)) || any(is.na(dat_all$stop))) {
+  stop("Interaction data contain missing start or stop times.")
+}
+
+if (any(dat_all$stop <= dat_all$start)) {
+  stop("Interaction data contain stop <= start intervals.")
+}
+
+if (any(!dat_all$event %in% c(0, 1))) {
+  stop("Interaction data contain event values other than 0/1.")
+}
+
+events_per_person <- tapply(
+  dat_all$event,
+  dat_all$individual_id,
+  sum,
+  na.rm = TRUE
+)
+
+if (any(events_per_person > 1)) {
+  stop("At least one participant has more than one death event.")
+}
+
+bad_overlap <- check_nonoverlap(dat_all)
+
+if (length(bad_overlap) > 0) {
+  stop(
+    "Overlapping person-period intervals detected for ",
+    length(bad_overlap),
+    " participant(s). First IDs: ",
+    paste(head(bad_overlap, 10), collapse = ", ")
+  )
+}
+
+# ---------------------------
+# 3. Match the updated Ever/Never model sample definition (HUKOU included)
+# ---------------------------
+# Marriage Unknown was excluded from BOTH revised separate-group Cox models
+# because it created severe sparse/zero-event instability. The interaction
+# analysis must therefore use the same rule for both groups.
+marriage_unknown_excluded <- dat_all[
+  as.character(dat_all$marriage_status) == "Unknown",
+  , drop = FALSE
+]
+
+after_marriage <- dat_all[
+  as.character(dat_all$marriage_status) != "Unknown",
+  , drop = FALSE
+]
+
+# Exactly match the updated Ever/Never Phase 1 complete-case HUKOU rule.
+# HUKOU-missing intervals are excluded ONLY here, never from common data.
+hukou_missing_excluded <- after_marriage[
+  is.na(after_marriage$hukou), , drop = FALSE
+]
+dat <- after_marriage[
+  !is.na(after_marriage$hukou), , drop = FALSE
+]
+dat <- droplevels(dat)
+
+# Re-assert factor order and reference categories.
+dat$dibao_group <- factor(
+  dat$dibao_group,
+  levels = c("Never", "Ever")
+)
+
+dat$sex <- factor(
+  dat$sex,
+  levels = c("Male", "Female")
+)
+
+dat$income_tertile <- factor(
+  dat$income_tertile,
+  levels = c("T1", "T2", "T3")
+)
+
+dat$marriage_status <- factor(
+  dat$marriage_status,
+  levels = c(
+    "Partnered",
+    "Widowed",
+    "Separated-Divorced",
+    "Never married"
+  )
+)
+
+dat$living_children <- factor(
+  dat$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+
+dat$coresident_child <- factor(
+  dat$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+
+# Same reference as both Phase 1 models: non-agricultural HUKOU.
+dat$hukou <- factor(
+  dat$hukou,
+  levels = c("Non-agricultural", "Agricultural")
+)
+
+dat$age_group <- factor(
+  dat$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+# Required modeled fields must be present after filtering/re-leveling.
+for (v in c(
+  "dibao_group", "sex", "income_tertile", "marriage_status",
+  "living_children", "coresident_child", "hukou", "age_group"
+)) {
+  if (any(is.na(dat[[v]]))) {
+    stop("Unexpected missing/invalid value in final interaction variable: ", v)
+  }
+}
+
+if (length(unique(dat$dibao_group)) != 2) {
+  stop("Both Never and Ever groups are required for interaction testing.")
+}
+
+if (sum(dat$event, na.rm = TRUE) == 0) {
+  stop("No death events remain in the interaction analysis data.")
+}
+
+# Guard against silently using a common RDS that does not match the RDS files
+# of the already-fitted Phase 1 models. Both studies must use the same rows.
+phase1_sample_check <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- dat[as.character(dat$dibao_group) == gr, , drop = FALSE]
+  m <- if (gr == "Ever") ever_results_object$main_model else
+    never_results_object$main_model
+  model_n <- as.integer(m$n)
+  model_deaths <- as.integer(m$nevent)
+  data_n <- nrow(d)
+  data_deaths <- sum(d$event)
+  data.frame(
+    dibao_group = gr,
+    interaction_intervals = data_n,
+    phase1_model_intervals = model_n,
+    interaction_deaths = data_deaths,
+    phase1_model_deaths = model_deaths,
+    matches_phase1 = data_n == model_n && data_deaths == model_deaths,
+    stringsAsFactors = FALSE
+  )
+}))
+if (any(is.na(phase1_sample_check$matches_phase1)) ||
+    !all(phase1_sample_check$matches_phase1)) {
+  stop("Interaction analysis rows/events do not match the Phase 1 Cox ",
+       "samples. Check that common/Ever/Never RDS files were generated ",
+       "from the SAME updated input files and models.")
+}
+
+if (length(unique(as.character(dat$hukou))) != 2L) {
+  stop("Both HUKOU categories must appear in the pooled Cox sample.")
+}
+
+# 4. Sample summary and QA
+# ---------------------------
+sample_summary <- do.call(
+  rbind,
+  lapply(c("Never", "Ever"), function(gr) {
+    d <- dat[as.character(dat$dibao_group) == gr, , drop = FALSE]
+
+    data.frame(
+      dibao_group = gr,
+      persons = length(unique(d$individual_id)),
+      households = length(unique(d$household_id)),
+      person_intervals = nrow(d),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      death_events = sum(d$event, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+marriage_unknown_exclusion_summary <- do.call(
+  rbind,
+  lapply(c("Never", "Ever"), function(gr) {
+    d <- marriage_unknown_excluded[
+      as.character(marriage_unknown_excluded$dibao_group) == gr,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      dibao_group = gr,
+      rule = "Marriage status Unknown excluded from formal interaction models",
+      records_excluded = nrow(d),
+      persons_affected = length(unique(d$individual_id)),
+      events_excluded = sum(d$event, na.rm = TRUE),
+      person_years_excluded = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+hukou_missing_exclusion_summary <- do.call(
+  rbind,
+  lapply(c("Never", "Ever"), function(gr) {
+    d <- hukou_missing_excluded[
+      as.character(hukou_missing_excluded$dibao_group) == gr,
+      , drop = FALSE
+    ]
+    data.frame(
+      dibao_group = gr,
+      rule = "First non-missing HUKOU absent in all waves; exclude from Cox",
+      records_excluded = nrow(d),
+      persons_affected = length(unique(d$individual_id)),
+      events_excluded = sum(d$event, na.rm = TRUE),
+      person_years_excluded = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+income_cutoff_table <- data.frame(
+  cutoff = c("33.333%", "66.667%"),
+  value = c(q1, q2),
+  method = "Same Method A common cutoffs generated by revised Ever script",
+  stringsAsFactors = FALSE
+)
+
+qa_variables <- c(
+  "sex",
+  "income_tertile",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "hukou",
+  "age_group"
+)
+
+cell_qa <- do.call(
+  rbind,
+  lapply(qa_variables, function(v) make_group_level_qa(dat, v))
+)
+
+sparse_qa <- cell_qa[
+  cell_qa$events < MIN_EVENTS_PER_GROUP_LEVEL,
+  , drop = FALSE
+]
+
+# ---------------------------
+# 5. Define primary and sensitivity interaction specifications
+# ---------------------------
+# PRIMARY substantive interaction levels.
+# Unknown missingness categories remain in the adjustment set but are not
+# included in the primary substantive heterogeneity test.
+primary_specs <- list(
+  sex = c("Female"),
+  income_tertile = c("T2", "T3"),
+  marriage_status = c("Widowed", "Separated-Divorced", "Never married"),
+  living_children = c("1", "2", "3+"),
+  coresident_child = c("Yes"),
+  hukou = c("Agricultural")
+)
+
+# ALL-LEVEL sensitivity interaction levels.
+# Here Unknown is additionally interacted for children and coresidence.
+all_level_specs <- list(
+  sex = c("Female"),
+  income_tertile = c("T2", "T3"),
+  marriage_status = c("Widowed", "Separated-Divorced", "Never married"),
+  living_children = c("1", "2", "3+", "Unknown"),
+  coresident_child = c("Yes", "Unknown"),
+  hukou = c("Agricultural")
+)
+
+# ---------------------------
+# 6. Verify primary interaction cells before fitting
+# ---------------------------
+primary_eligibility <- data.frame()
+
+for (target in names(primary_specs)) {
+  for (lev in primary_specs[[target]]) {
+    z <- cell_qa[
+      cell_qa$variable == target &
+        cell_qa$level == lev &
+        cell_qa$dibao_group %in% c("Never", "Ever"),
+      , drop = FALSE
+    ]
+
+    never_events <- if (any(z$dibao_group == "Never")) {
+      z$events[z$dibao_group == "Never"][1]
+    } else {
+      NA_real_
+    }
+
+    ever_events <- if (any(z$dibao_group == "Ever")) {
+      z$events[z$dibao_group == "Ever"][1]
+    } else {
+      NA_real_
+    }
+
+    eligible <- !is.na(never_events) && !is.na(ever_events) &&
+      never_events >= MIN_EVENTS_PER_GROUP_LEVEL &&
+      ever_events >= MIN_EVENTS_PER_GROUP_LEVEL
+
+    primary_eligibility <- rbind(
+      primary_eligibility,
+      data.frame(
+        factor = target,
+        level = lev,
+        Never_events = never_events,
+        Ever_events = ever_events,
+        eligible = eligible,
+        rule = paste0(
+          ">=", MIN_EVENTS_PER_GROUP_LEVEL,
+          " deaths in both Dibao groups"
+        ),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+if (any(!primary_eligibility$eligible)) {
+  bad <- primary_eligibility[!primary_eligibility$eligible, , drop = FALSE]
+  stop(
+    "At least one PRIMARY substantive interaction level does not meet the ",
+    "prespecified event-count stability rule. Inspect primary_eligibility.\n",
+    paste(
+      paste0(
+        bad$factor, " / ", bad$level,
+        " (Never events=", bad$Never_events,
+        ", Ever events=", bad$Ever_events, ")"
+      ),
+      collapse = "\n"
+    )
+  )
+}
+
+# 7. Function to fit one-factor-at-a-time interaction models
+# ---------------------------
+fit_interaction_set <- function(data, specs, analysis_label) {
+  models <- list()
+  block_tests <- data.frame()
+  level_HRs <- data.frame()
+  coefficients <- data.frame()
+  ph_tables <- data.frame()
+  ph_objects <- list()
+  warnings_table <- data.frame()
+
+  for (target in names(specs)) {
+    tmp <- add_interaction_columns(
+      data,
+      target,
+      specs[[target]]
+    )
+
+    model_data <- tmp$data
+    int_names <- tmp$interaction_names
+    level_map <- tmp$level_map
+    form <- build_formula(int_names)
+
+    fit_obj <- fit_cox_with_warnings(form, model_data)
+    fit <- fit_obj$fit
+
+    model_name <- paste0(analysis_label, "_", target)
+    models[[target]] <- fit
+
+    # Robust block Wald test: H0 = all interaction coefficients for target = 0.
+    block <- wald_block(fit, int_names)
+    block$analysis <- analysis_label
+    block$factor <- target
+    block$n_interaction_terms <- length(int_names)
+
+    block_tests <- rbind(
+      block_tests,
+      block[, c(
+        "analysis", "factor", "chisq", "df", "p_value",
+        "n_interaction_terms", "status"
+      )]
+    )
+
+    # All model coefficients.
+    cc <- extract_cox_results(fit)
+    cc$analysis <- analysis_label
+    cc$factor_tested <- target
+
+    coefficients <- rbind(
+      coefficients,
+      cc[, c(
+        "analysis", "factor_tested",
+        setdiff(names(cc), c("analysis", "factor_tested"))
+      )]
+    )
+
+    # Level-specific Never HR, Ever HR, and Ever/Never HR ratio.
+    for (j in seq_len(nrow(level_map))) {
+      rr <- make_level_hr_row(
+        fit = fit,
+        variable = target,
+        level = level_map$level[j],
+        interaction_term = level_map$interaction_term[j]
+      )
+      rr$analysis <- analysis_label
+
+      level_HRs <- rbind(
+        level_HRs,
+        rr[, c("analysis", setdiff(names(rr), "analysis"))]
+      )
+    }
+
+    # PH diagnostics.
+    ph_diag <- run_ph_diagnostic(
+      form,
+      model_data,
+      fit,
+      model_name
+    )
+
+    ph_objects[[target]] <- ph_diag$object
+    ph_tables <- rbind(ph_tables, ph_diag$table)
+
+    # Capture coxph warnings.
+    if (length(fit_obj$warnings) > 0) {
+      warnings_table <- rbind(
+        warnings_table,
+        data.frame(
+          analysis = analysis_label,
+          model = target,
+          warning = fit_obj$warnings,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+
+  list(
+    models = models,
+    block_tests = block_tests,
+    level_HRs = level_HRs,
+    coefficients = coefficients,
+    ph_tables = ph_tables,
+    ph_objects = ph_objects,
+    warnings = warnings_table
+  )
+}
+
+# ---------------------------
+# 8. PRIMARY one-factor-at-a-time substantive interaction models
+# ---------------------------
+primary_results <- fit_interaction_set(
+  data = dat,
+  specs = primary_specs,
+  analysis_label = "Primary_Substantive"
+)
+
+primary_level_readable <- make_readable_interaction(
+  primary_results$level_HRs
+)
+
+# ---------------------------
+# 9. ALL-LEVEL one-factor-at-a-time sensitivity models
+# ---------------------------
+all_level_results <- fit_interaction_set(
+  data = dat,
+  specs = all_level_specs,
+  analysis_label = "Sensitivity_AllLevels"
+)
+
+all_level_readable <- make_readable_interaction(
+  all_level_results$level_HRs
+)
+
+# ---------------------------
+# 10. Full interaction model helper
+# ---------------------------
+fit_full_interaction_model <- function(data, specs, analysis_label) {
+  full_data <- data
+  full_blocks <- list()
+  full_level_map <- list()
+  all_interaction_names <- character(0)
+
+  for (target in names(specs)) {
+    tmp <- add_interaction_columns(
+      full_data,
+      target,
+      specs[[target]]
+    )
+
+    full_data <- tmp$data
+    full_blocks[[target]] <- tmp$interaction_names
+    full_level_map[[target]] <- tmp$level_map
+    all_interaction_names <- c(
+      all_interaction_names,
+      tmp$interaction_names
+    )
+  }
+
+  full_formula <- build_formula(all_interaction_names)
+  fit_obj <- fit_cox_with_warnings(full_formula, full_data)
+  fit <- fit_obj$fit
+
+  block_tests <- data.frame()
+  level_HRs <- data.frame()
+
+  for (target in names(specs)) {
+    int_names <- full_blocks[[target]]
+    block <- wald_block(fit, int_names)
+    block$analysis <- analysis_label
+    block$factor <- target
+    block$n_interaction_terms <- length(int_names)
+
+    block_tests <- rbind(
+      block_tests,
+      block[, c(
+        "analysis", "factor", "chisq", "df", "p_value",
+        "n_interaction_terms", "status"
+      )]
+    )
+
+    lm <- full_level_map[[target]]
+
+    for (j in seq_len(nrow(lm))) {
+      rr <- make_level_hr_row(
+        fit = fit,
+        variable = target,
+        level = lm$level[j],
+        interaction_term = lm$interaction_term[j]
+      )
+      rr$analysis <- analysis_label
+
+      level_HRs <- rbind(
+        level_HRs,
+        rr[, c("analysis", setdiff(names(rr), "analysis"))]
+      )
+    }
+  }
+
+  coefficients <- extract_cox_results(fit)
+  coefficients$analysis <- analysis_label
+  coefficients <- coefficients[, c(
+    "analysis", setdiff(names(coefficients), "analysis")
+  )]
+
+  ph_diag <- run_ph_diagnostic(
+    full_formula,
+    full_data,
+    fit,
+    analysis_label
+  )
+
+  warning_table <- if (length(fit_obj$warnings) > 0) {
+    data.frame(
+      analysis = analysis_label,
+      model = "Full interaction model",
+      warning = fit_obj$warnings,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame()
+  }
+
+  list(
+    model = fit,
+    formula = full_formula,
+    block_tests = block_tests,
+    level_HRs = level_HRs,
+    level_HRs_readable = make_readable_interaction(level_HRs),
+    coefficients = coefficients,
+    ph = ph_diag$object,
+    ph_table = ph_diag$table,
+    warnings = warning_table
+  )
+}
+
+# 11. Full substantive interaction sensitivity model
+# ---------------------------
+full_substantive <- fit_full_interaction_model(
+  data = dat,
+  specs = primary_specs,
+  analysis_label = "Full_Substantive"
+)
+
+# ---------------------------
+# 12. Full all-level sensitivity model
+# ---------------------------
+full_all_levels <- fit_full_interaction_model(
+  data = dat,
+  specs = all_level_specs,
+  analysis_label = "Full_AllLevels"
+)
+
+# ---------------------------
+# 13. Interaction-cell QA and sensitivity flags
+# ---------------------------
+# The all-level sensitivity model may contain low-event Unknown categories.
+# Flag them explicitly; do not silently interpret them as stable substantive
+# effects.
+all_level_interaction_qa <- data.frame()
+
+for (target in names(all_level_specs)) {
+  for (lev in all_level_specs[[target]]) {
+    z <- cell_qa[
+      cell_qa$variable == target &
+        cell_qa$level == lev &
+        cell_qa$dibao_group %in% c("Never", "Ever"),
+      , drop = FALSE
+    ]
+
+    never_events <- if (any(z$dibao_group == "Never")) {
+      z$events[z$dibao_group == "Never"][1]
+    } else {
+      NA_real_
+    }
+
+    ever_events <- if (any(z$dibao_group == "Ever")) {
+      z$events[z$dibao_group == "Ever"][1]
+    } else {
+      NA_real_
+    }
+
+    all_level_interaction_qa <- rbind(
+      all_level_interaction_qa,
+      data.frame(
+        factor = target,
+        level = lev,
+        Never_events = never_events,
+        Ever_events = ever_events,
+        low_event_flag =
+          is.na(never_events) || is.na(ever_events) ||
+          never_events < MIN_EVENTS_PER_GROUP_LEVEL ||
+          ever_events < MIN_EVENTS_PER_GROUP_LEVEL,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# ---------------------------
+# 14. Side-by-side independent group results (descriptive only)
+# ---------------------------
+# These are NOT the formal interaction results. They are included only to help
+# the reader compare the separately fitted Ever and Never main Cox models.
+independent_group_comparison <- data.frame()
+
+if (!is.null(ever_results_object) &&
+    !is.null(ever_results_object$main_results_readable) &&
+    !is.null(never_results_object$main_results_readable)) {
+
+  ev <- ever_results_object$main_results_readable
+  nv <- never_results_object$main_results_readable
+
+  ev2 <- ev[, c("comparison", "HR", "lower_95", "upper_95", "p_value")]
+  nv2 <- nv[, c("comparison", "HR", "lower_95", "upper_95", "p_value")]
+
+  names(ev2)[-1] <- paste0("Ever_", names(ev2)[-1])
+  names(nv2)[-1] <- paste0("Never_", names(nv2)[-1])
+
+  independent_group_comparison <- merge(
+    nv2,
+    ev2,
+    by = "comparison",
+    all = TRUE,
+    sort = FALSE
+  )
+}
+
+# ---------------------------
+# 15. Combine warnings
+# ---------------------------
+model_warning_table <- rbind(
+  primary_results$warnings,
+  all_level_results$warnings,
+  full_substantive$warnings,
+  full_all_levels$warnings
+)
+
+if (nrow(model_warning_table) == 0) {
+  model_warning_table <- data.frame(
+    analysis = "None",
+    model = "None",
+    warning = "No coxph warnings captured",
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------
+# 16. PH diagnostic PDFs
+# ---------------------------
+# One PDF for each PRIMARY substantive interaction model.
+for (target in names(primary_results$models)) {
+  ph <- primary_results$ph_objects[[target]]
+
+  if (!inherits(ph, "cox_zph_error")) {
+    pdf(file.path(
+      OUTPUT_DIR,
+      paste0("A_Interaction_PH_Primary_", safe_name(target), ".pdf")
+    ))
+    try(plot(ph), silent = TRUE)
+    dev.off()
+  }
+}
+
+if (!inherits(full_substantive$ph, "cox_zph_error")) {
+  pdf(file.path(OUTPUT_DIR, "A_Interaction_PH_Full_Substantive.pdf"))
+  try(plot(full_substantive$ph), silent = TRUE)
+  dev.off()
+}
+
+if (!inherits(full_all_levels$ph, "cox_zph_error")) {
+  pdf(file.path(OUTPUT_DIR, "A_Interaction_PH_Full_AllLevels.pdf"))
+  try(plot(full_all_levels$ph), silent = TRUE)
+  dev.off()
+}
+
+# 17. Save R model/results object
+# ---------------------------
+saveRDS(
+  list(
+    method = "Method A revised Ever-vs-Never interaction analysis",
+    common_rds = COMMON_RDS,
+    income_cutoffs = c(q1 = q1, q2 = q2),
+    interaction_model_data = dat,
+    sample_summary = sample_summary,
+    marriage_unknown_exclusion = marriage_unknown_exclusion_summary,
+    hukou_missing_exclusion = hukou_missing_exclusion_summary,
+    hukou_qa = common$hukou_qa,
+    phase1_sample_check = phase1_sample_check,
+    cell_qa = cell_qa,
+    sparse_qa = sparse_qa,
+    primary_eligibility = primary_eligibility,
+    all_level_interaction_qa = all_level_interaction_qa,
+    primary_models = primary_results$models,
+    primary_block_tests = primary_results$block_tests,
+    primary_level_HRs = primary_results$level_HRs,
+    primary_coefficients = primary_results$coefficients,
+    primary_ph = primary_results$ph_tables,
+    all_level_models = all_level_results$models,
+    all_level_block_tests = all_level_results$block_tests,
+    all_level_level_HRs = all_level_results$level_HRs,
+    all_level_coefficients = all_level_results$coefficients,
+    all_level_ph = all_level_results$ph_tables,
+    full_substantive = full_substantive,
+    full_all_levels = full_all_levels,
+    independent_group_comparison = independent_group_comparison,
+    warnings = model_warning_table
+  ),
+  file.path(
+    OUTPUT_DIR,
+    "A_Dibao_interaction_models_and_results_revised.rds"
+  )
+)
+
+# ---------------------------
+# 18. Excel workbook
+# ---------------------------
+wb <- createWorkbook()
+
+add_sheet(wb, "Sample_Summary", sample_summary)
+add_sheet(wb, "Tertile_Cutoffs", income_cutoff_table)
+add_sheet(wb, "Marriage_Unknown_Excl", marriage_unknown_exclusion_summary)
+add_sheet(wb, "Hukou_Missing_Excl", hukou_missing_exclusion_summary)
+add_sheet(wb, "Hukou_QA", common$hukou_qa)
+add_sheet(wb, "Phase1_Sample_Check", phase1_sample_check)
+add_sheet(wb, "Primary_Eligibility", primary_eligibility)
+add_sheet(wb, "Primary_Block", primary_results$block_tests)
+add_sheet(wb, "Primary_Level_HRs", primary_level_readable)
+add_sheet(wb, "Primary_Coeff", primary_results$coefficients)
+add_sheet(wb, "Primary_PH", primary_results$ph_tables)
+add_sheet(wb, "AllLevel_Block", all_level_results$block_tests)
+add_sheet(wb, "AllLevel_Level_HRs", all_level_readable)
+add_sheet(wb, "AllLevel_Coeff", all_level_results$coefficients)
+add_sheet(wb, "AllLevel_PH", all_level_results$ph_tables)
+add_sheet(wb, "FullSub_Block", full_substantive$block_tests)
+add_sheet(wb, "FullSub_Level_HRs", full_substantive$level_HRs_readable)
+add_sheet(wb, "FullSub_Coeff", full_substantive$coefficients)
+add_sheet(wb, "FullSub_PH", full_substantive$ph_table)
+add_sheet(wb, "FullAll_Block", full_all_levels$block_tests)
+add_sheet(wb, "FullAll_Level_HRs", full_all_levels$level_HRs_readable)
+add_sheet(wb, "FullAll_Coeff", full_all_levels$coefficients)
+add_sheet(wb, "FullAll_PH", full_all_levels$ph_table)
+add_sheet(wb, "Cell_QA", cell_qa)
+add_sheet(wb, "Sparse_QA", sparse_qa)
+add_sheet(wb, "AllLevel_Interaction_QA", all_level_interaction_qa)
+add_sheet(wb, "Independent_Group_HRs", independent_group_comparison)
+add_sheet(wb, "Model_Warnings", model_warning_table)
+
+saveWorkbook(
+  wb,
+  file.path(OUTPUT_DIR, "A_Dibao_Interaction_results_revised.xlsx"),
+  overwrite = TRUE
+)
+
+# ---------------------------
+# 19. CSV exports
+# ---------------------------
+write.csv(
+  hukou_missing_exclusion_summary,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Hukou_Missing_Excl.csv"),
+  row.names = FALSE,
+  na = ""
+)
+write.csv(
+  phase1_sample_check,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Phase1_Sample_Check.csv"),
+  row.names = FALSE,
+  na = ""
+)
+write.csv(
+  primary_results$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Primary_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  primary_level_readable,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Primary_Level_HRs.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  primary_results$ph_tables,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Primary_PH.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  all_level_results$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_AllLevel_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  all_level_readable,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_AllLevel_Level_HRs.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  full_substantive$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_FullSub_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  full_substantive$level_HRs_readable,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_FullSub_Level_HRs.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  full_all_levels$block_tests,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_FullAll_Block.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  cell_qa,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Cell_QA.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sparse_qa,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Sparse_QA.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  model_warning_table,
+  file.path(OUTPUT_DIR, "csv", "A_Interaction_Model_Warnings.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(OUTPUT_DIR, "A_Interaction_sessionInfo.txt")
+)
+
+# ---------------------------
+# 20. Directly show the most important results in R / RStudio
+# ---------------------------
+print_table_section(
+  "METHOD A - EVER VS NEVER: INTERACTION ANALYSIS SAMPLE",
+  sample_summary
+)
+
+print_table_section(
+  "MARRIAGE UNKNOWN EXCLUSION QA",
+  marriage_unknown_exclusion_summary
+)
+print_table_section(
+  "HUKOU MISSINGNESS EXCLUSION QA",
+  hukou_missing_exclusion_summary
+)
+print_table_section(
+  "PHASE 1 / INTERACTION SAMPLE CONSISTENCY CHECK",
+  phase1_sample_check
+)
+
+print_table_section(
+  "PRIMARY SUBSTANTIVE INTERACTION ELIGIBILITY",
+  primary_eligibility
+)
+
+print_table_section(
+  "PRIMARY SUBSTANTIVE BLOCK INTERACTION TESTS",
+  primary_results$block_tests
+)
+
+print_table_section(
+  "PRIMARY LEVEL-SPECIFIC HRs AND EVER/NEVER HR RATIOS",
+  primary_level_readable[, c(
+    "factor",
+    "comparison",
+    "Never_HR_95CI",
+    "Ever_HR_95CI",
+    "HR_ratio_95CI",
+    "interaction_p_display"
+  )]
+)
+
+# Show only GLOBAL PH rows in the console for compactness.
+primary_ph_global <- primary_results$ph_tables[
+  primary_results$ph_tables$term == "GLOBAL" |
+    primary_results$ph_tables$term == "PH_TEST_ERROR",
+  , drop = FALSE
+]
+
+print_table_section(
+  "PRIMARY INTERACTION MODELS - GLOBAL PH DIAGNOSTICS",
+  primary_ph_global
+)
+
+print_table_section(
+  "ALL-LEVEL SENSITIVITY BLOCK TESTS",
+  all_level_results$block_tests
+)
+
+print_table_section(
+  "ALL-LEVEL INTERACTION CELL QA",
+  all_level_interaction_qa
+)
+
+print_table_section(
+  "FULL SUBSTANTIVE INTERACTION MODEL - BLOCK TESTS",
+  full_substantive$block_tests
+)
+
+print_table_section(
+  "FULL ALL-LEVEL INTERACTION MODEL - BLOCK TESTS",
+  full_all_levels$block_tests
+)
+
+print_table_section(
+  "MODEL WARNINGS",
+  model_warning_table
+)
+
+# Optional RStudio data viewers.
+if (interactive()) {
+  View(
+    primary_results$block_tests,
+    title = "Dibao Interaction - Primary Block Tests"
+  )
+
+  View(
+    primary_level_readable,
+    title = "Dibao Interaction - Primary Level HRs"
+  )
+
+  View(
+    primary_results$ph_tables,
+    title = "Dibao Interaction - Primary PH Diagnostics"
+  )
+}
+
+cat("\n", paste(rep("=", 78), collapse = ""), "\n", sep = "")
+cat("Method A - revised Ever vs Never interaction analysis completed.\n")
+cat(
+  "Main workbook: ",
+  file.path(OUTPUT_DIR, "A_Dibao_Interaction_results_revised.xlsx"),
+  "\n",
+  sep = ""
+)
+cat(
+  "Main RDS: ",
+  file.path(OUTPUT_DIR, "A_Dibao_interaction_models_and_results_revised.rds"),
+  "\n",
+  sep = ""
+)
+cat("PRIMARY inference should use Primary_Block + Primary_Level_HRs.\n")
+cat("HUKOU is adjusted in every model and interacted as factor #6.\n")
+cat("All Cox HRs require proportionate-hazards assumption review.\n")
+cat("AllLevel and Full models are sensitivity analyses.\n")
+cat(paste(rep("=", 78), collapse = ""), "\n", sep = "")
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+

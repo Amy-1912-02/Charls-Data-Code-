@@ -1,0 +1,908 @@
+---
+title: "Appendix"
+author: "Haoran Hao"
+date: "2026-11-21"
+output: html_document
+---
+
+```{r}
+install.packages("flextable")
+```
+
+
+```{r}
+# Model A1 and A2 supplementary tables
+# Input files use the confirmed names without extra parenthesised suffixes.
+# Run in RStudio with Source, or run:
+# Rscript Model_A_tables.R "/path/to/A_Cox_outputs" "/path/to/output"
+
+# 1. File locations --------------------------------------------------------
+data_dir <- "/Users/apple/Desktop/Bag/rolling/Postgraduate/ADV/Week 4/data/A_Cox_outputs"
+output_dir <- file.path(getwd(), "outputs")
+
+arguments <- commandArgs(trailingOnly = TRUE)
+if (length(arguments) >= 1) data_dir <- arguments[1]
+if (length(arguments) >= 2) output_dir <- arguments[2]
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 2. Packages --------------------------------------------------------------
+packages <- c("readxl", "officer", "flextable", "openxlsx")
+
+# Install packages only if they are missing
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+# Load packages
+library(readxl)
+library(officer)
+library(flextable)
+library(openxlsx)
+
+ever_file <- file.path(data_dir, "A_Ever Dibao_Hukou.xlsx")
+never_file <- file.path(data_dir, "A_Never_Dibao_Hukou.xlsx")
+interaction_file <- file.path(data_dir, "A_Dibao_Interaction_Hukou.xlsx")
+stopifnot(file.exists(ever_file), file.exists(never_file),
+          file.exists(interaction_file))
+
+# 3. Read the numeric source results ---------------------------------------
+ever <- as.data.frame(read_excel(ever_file, sheet = "Main_Cox"))
+never <- as.data.frame(read_excel(never_file, sheet = "Main_Cox"))
+a2 <- as.data.frame(read_excel(interaction_file, sheet = "Primary_Level_HRs"))
+blocks <- as.data.frame(read_excel(interaction_file, sheet = "Primary_Block"))
+samples <- as.data.frame(read_excel(interaction_file, sheet = "Sample_Summary"))
+sample_check <- as.data.frame(
+  read_excel(interaction_file, sheet = "Phase1_Sample_Check")
+)
+stopifnot(all(sample_check$matches_phase1))
+
+# 4. Labels and row order ---------------------------------------------------
+factor_order <- c("sex", "income_tertile", "marriage_status",
+                  "living_children", "coresident_child", "hukou")
+group_labels <- c(
+  sex = "Sex (reference Male)",
+  income_tertile = "Income (reference T1)",
+  marriage_status = "Marital status (reference Partnered)",
+  living_children = "Living children (reference 0)",
+  coresident_child = "Child coresidence (reference No)",
+  hukou = "Hukou (reference Non-agricultural)"
+)
+
+labels1 <- data.frame(
+  factor = c("sex", rep("income_tertile", 2), rep("marriage_status", 3),
+             rep("living_children", 4), rep("coresident_child", 2), "hukou"),
+  term = c("sexFemale", "income_tertileT2", "income_tertileT3",
+           "marriage_statusWidowed", "marriage_statusSeparated-Divorced",
+           "marriage_statusNever married", "living_children1",
+           "living_children2", "living_children3+", "living_childrenUnknown",
+           "coresident_childYes", "coresident_childUnknown", "hukouAgricultural"),
+  label = c("Female", "T2", "T3", "Widowed", "Separated/Divorced",
+            "Never married", "1 child", "2 children", "3+ children", "Unknown",
+            "Yes", "Unknown", "Agricultural"),
+  stringsAsFactors = FALSE
+)
+
+labels2 <- data.frame(
+  factor = c("sex", rep("income_tertile", 2), rep("marriage_status", 3),
+             rep("living_children", 3), "coresident_child", "hukou"),
+  comparison = c(
+    "Sex: Female vs Male", "Income: T2 vs T1", "Income: T3 vs T1",
+    "Marriage: Widowed vs Partnered",
+    "Marriage: Separated-Divorced vs Partnered",
+    "Marriage: Never married vs Partnered",
+    "Living children: 1 vs 0", "Living children: 2 vs 0",
+    "Living children: 3+ vs 0", "Coresident child: Yes vs No",
+    "HUKOU: Agricultural vs Non-agricultural"
+  ),
+  label = c("Female", "T2", "T3", "Widowed", "Separated/Divorced",
+            "Never married", "1 child", "2 children", "3+ children",
+            "Yes", "Agricultural"),
+  stringsAsFactors = FALSE
+)
+
+# Match by names, so the source row order cannot change the comparisons.
+stopifnot(!anyDuplicated(ever$term), !anyDuplicated(never$term),
+          !anyDuplicated(a2$comparison), !anyDuplicated(blocks$factor))
+stopifnot(setequal(ever$term, labels1$term),
+          setequal(never$term, labels1$term),
+          setequal(a2$comparison, labels2$comparison),
+          setequal(blocks$factor, factor_order))
+ever <- ever[match(labels1$term, ever$term), ]
+never <- never[match(labels1$term, never$term), ]
+a2 <- a2[match(labels2$comparison, a2$comparison), ]
+blocks <- blocks[match(factor_order, blocks$factor), ]
+stopifnot(identical(a2$factor, labels2$factor))
+
+# 5. Check the values used in the tables ------------------------------------
+numeric_columns <- c("beta", "robust_se", "HR", "lower_95", "upper_95", "p_value")
+for (data in list(ever, never)) {
+  stopifnot(all(numeric_columns %in% names(data)),
+            all(is.finite(as.matrix(data[numeric_columns]))),
+            all(data$HR > 0), all(data$lower_95 > 0),
+            all(data$lower_95 <= data$HR), all(data$HR <= data$upper_95),
+            all(data$p_value >= 0 & data$p_value <= 1),
+            isTRUE(all.equal(data$HR, exp(data$beta), tolerance = 1e-7)))
+}
+a2_columns <- c("Never_HR", "Never_lower_95", "Never_upper_95", "Never_p",
+                "Ever_HR", "Ever_lower_95", "Ever_upper_95", "Ever_p",
+                "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+                "interaction_p")
+stopifnot(all(a2_columns %in% names(a2)),
+          all(is.finite(as.matrix(a2[a2_columns]))),
+          all(is.finite(blocks$p_value)),
+          all(blocks$p_value >= 0 & blocks$p_value <= 1),
+          all(a2$interaction_p >= 0 & a2$interaction_p <= 1),
+          isTRUE(all.equal(a2$HR_ratio_Ever_vs_Never,
+                           a2$Ever_HR / a2$Never_HR, tolerance = 1e-7)))
+for (prefix in c("Never", "Ever")) {
+  stopifnot(all(a2[[paste0(prefix, "_lower_95")]] > 0),
+            all(a2[[paste0(prefix, "_lower_95")]] <= a2[[paste0(prefix, "_HR")]]),
+            all(a2[[paste0(prefix, "_HR")]] <= a2[[paste0(prefix, "_upper_95")]]))
+}
+stopifnot(all(a2$ratio_lower_95 > 0),
+          all(a2$ratio_lower_95 <= a2$HR_ratio_Ever_vs_Never),
+          all(a2$HR_ratio_Ever_vs_Never <= a2$ratio_upper_95))
+
+# 6. Display formats -------------------------------------------------------
+format_hr <- function(hr, lower, upper) {
+  sprintf("%.3f (%.3f-%.3f)", hr, lower, upper)
+}
+format_p <- function(p) {
+  result <- sprintf("%.3f", p)
+  near_cutoff <- p >= 0.045 & p <= 0.055
+  result[near_cutoff] <- sprintf("%.4f", p[near_cutoff])
+  result[p < 0.001] <- "<.001"
+  sub("^0", "", result)
+}
+
+# 7. Table 1: separate models in the two groups -----------------------------
+a1_numeric <- data.frame(
+  Factor = labels1$factor, Comparison = labels1$label, Term = labels1$term,
+  Never_beta = never$beta, Never_robust_se = never$robust_se,
+  Never_HR = never$HR, Never_lower_95 = never$lower_95,
+  Never_upper_95 = never$upper_95, Never_p = never$p_value,
+  Ever_beta = ever$beta, Ever_robust_se = ever$robust_se,
+  Ever_HR = ever$HR, Ever_lower_95 = ever$lower_95,
+  Ever_upper_95 = ever$upper_95, Ever_p = ever$p_value
+)
+a1_display <- data.frame(
+  Comparison = paste0("  ", labels1$label),
+  Never_HR_CI = format_hr(never$HR, never$lower_95, never$upper_95),
+  Never_p = format_p(never$p_value),
+  Ever_HR_CI = format_hr(ever$HR, ever$lower_95, ever$upper_95),
+  Ever_p = format_p(ever$p_value)
+)
+table1 <- a1_display[0, ]
+group_rows1 <- integer()
+for (factor_name in factor_order) {
+  group_rows1 <- c(group_rows1, nrow(table1) + 1L)
+  heading <- data.frame(Comparison = unname(group_labels[factor_name]),
+                        Never_HR_CI = "", Never_p = "",
+                        Ever_HR_CI = "", Ever_p = "")
+  table1 <- rbind(table1, heading,
+                  a1_display[labels1$factor == factor_name, ])
+}
+
+# 8. Table 2: pooled stratified interaction models --------------------------
+a2_numeric <- a2[c("factor", "comparison", a2_columns)]
+a2_numeric$overall_interaction_p <- blocks$p_value[
+  match(a2$factor, blocks$factor)
+]
+a2_display <- data.frame(
+  Comparison = paste0("  ", labels2$label),
+  Never_HR_CI = format_hr(a2$Never_HR, a2$Never_lower_95, a2$Never_upper_95),
+  Ever_HR_CI = format_hr(a2$Ever_HR, a2$Ever_lower_95, a2$Ever_upper_95),
+  RHR_CI = format_hr(a2$HR_ratio_Ever_vs_Never,
+                     a2$ratio_lower_95, a2$ratio_upper_95),
+  Contrast_p = format_p(a2$interaction_p),
+  Overall_p = ""
+)
+table2 <- a2_display[0, ]
+group_rows2 <- integer()
+for (factor_name in factor_order) {
+  group_rows2 <- c(group_rows2, nrow(table2) + 1L)
+  heading <- data.frame(
+    Comparison = unname(group_labels[factor_name]),
+    Never_HR_CI = "", Ever_HR_CI = "", RHR_CI = "", Contrast_p = "",
+    Overall_p = format_p(blocks$p_value[blocks$factor == factor_name])
+  )
+  table2 <- rbind(table2, heading,
+                  a2_display[labels2$factor == factor_name, ])
+}
+
+title1 <- "Table 1 Model A1 group-specific mortality associations"
+title2 <- "Table 2 Model A2 between-group differences in mortality associations"
+stopifnot(setequal(samples$dibao_group, c("Never", "Ever")))
+sample_note <- sprintf(
+  "Never Dibao: %s respondents and %s deaths. Ever Dibao: %s respondents and %s deaths.",
+  format(samples$persons[samples$dibao_group == "Never"], big.mark = ","),
+  format(samples$death_events[samples$dibao_group == "Never"], big.mark = ","),
+  format(samples$persons[samples$dibao_group == "Ever"], big.mark = ","),
+  format(samples$death_events[samples$dibao_group == "Ever"], big.mark = ",")
+)
+note1 <- paste(
+  sample_note,
+  "HR = hazard ratio. CI = confidence interval.",
+  "Separate Cox models were stratified by age group and adjusted for all six factors.",
+  "Standard errors were clustered by individual.",
+  "Unknown child-number and coresidence categories were retained as adjustment terms."
+)
+note2 <- paste(
+  sample_note,
+  "HR = hazard ratio. CI = confidence interval. RHR = Ever Dibao HR / Never Dibao HR.",
+  "Each model tested one factor's interaction with Dibao group, stratified by age group and Dibao group.",
+  "Other factor coefficients were shared between groups. Standard errors were clustered by individual.",
+  "Contrast p refers to the category-specific interaction. Overall p is the factor-level Wald test.",
+  "All p values are unadjusted. Unknown categories were adjustment terms without group interactions."
+)
+headers1 <- c(Comparison = "Variable or contrast", Never_HR_CI = "HR (95% CI)",
+              Never_p = "p", Ever_HR_CI = "HR (95% CI)", Ever_p = "p")
+headers2 <- c(Comparison = "Variable or contrast",
+              Never_HR_CI = "Never Dibao\nHR (95% CI)",
+              Ever_HR_CI = "Ever Dibao\nHR (95% CI)",
+              RHR_CI = "Ever/Never\nRHR (95% CI)",
+              Contrast_p = "Contrast\np", Overall_p = "Overall\np")
+# Convert the explicit newline markers in the column labels.
+headers2 <- gsub("\\n", "\n", headers2)
+
+# 9. Word tables -----------------------------------------------------------
+make_table <- function(data, headers, groups, widths) {
+  ft <- flextable(data)
+  ft <- set_header_labels(ft, values = as.list(headers))
+  ft <- theme_booktabs(ft)
+  ft <- bold(ft, part = "header")
+  ft <- font(ft, fontname = "Times New Roman", part = "all")
+  ft <- fontsize(ft, size = 12, part = "all")
+  ft <- color(ft, color = "black", part = "all")
+  ft <- bold(ft, i = groups, part = "body")
+  ft <- align(ft, align = "center", part = "all")
+  ft <- align(ft, j = 1, align = "left", part = "all")
+  ft <- valign(ft, valign = "center", part = "all")
+  ft <- padding(ft, padding = 2, part = "all")
+  ft <- width(ft, j = seq_along(widths), width = widths)
+  ft <- set_table_properties(ft, layout = "fixed", align = "center",
+                            opts_word = list(split = FALSE))
+  paginate(ft, init = FALSE, hdr_ftr = TRUE)
+}
+ft1 <- make_table(table1, headers1, group_rows1, c(3.5, 2.3, 0.8, 2.3, 0.8))
+ft1 <- add_header_row(ft1, values = c("", "Never Dibao", "Ever Dibao"),
+                      colwidths = c(1, 2, 2), top = TRUE)
+ft1 <- merge_v(ft1, j = 1, part = "header")
+ft1 <- bold(ft1, part = "header")
+ft1 <- align(ft1, align = "center", part = "header")
+ft1 <- align(ft1, j = 1, align = "left", part = "header")
+ft1 <- italic(ft1, j = c(3, 5), i = 2, part = "header")
+ft2 <- make_table(table2, headers2, group_rows2,
+                   c(3.0, 1.75, 1.75, 1.75, 0.85, 0.85))
+
+title_style <- fp_text(font.family = "Times New Roman",
+                       font.size = 12, bold = TRUE)
+note_style <- fp_text(font.family = "Times New Roman", font.size = 12)
+doc <- read_docx()
+doc <- body_set_default_section(doc, prop_section(
+  page_size = page_size(orient = "landscape"),
+  page_margins = page_mar(top = 0.55, bottom = 0.55,
+                          left = 0.65, right = 0.65)
+))
+doc <- body_add_fpar(doc, fpar(ftext(title1, title_style),
+                              fp_p = fp_par(keep_with_next = TRUE)))
+doc <- body_add_flextable(doc, ft1)
+doc <- body_add_fpar(doc, fpar(ftext(note1, note_style)))
+doc <- body_add_break(doc)
+doc <- body_add_fpar(doc, fpar(ftext(title2, title_style),
+                              fp_p = fp_par(keep_with_next = TRUE)))
+doc <- body_add_flextable(doc, ft2)
+doc <- body_add_fpar(doc, fpar(ftext(note2, note_style)))
+word_file <- file.path(output_dir, "Model_A_tables.docx")
+print(doc, target = word_file)
+
+# 10. Excel presentation tables and unrounded numeric results ---------------
+wb <- createWorkbook()
+modifyBaseFont(wb, fontSize = 12, fontName = "Times New Roman")
+header_style <- createStyle(textDecoration = "bold", halign = "center",
+                             valign = "center", wrapText = TRUE,
+                             border = "bottom")
+group_style <- createStyle(textDecoration = "bold")
+note_style_xlsx <- createStyle(wrapText = TRUE, valign = "top")
+p_style <- createStyle(numFmt = "0.0000000000")
+number_style <- createStyle(numFmt = "0.000000")
+
+add_presentation <- function(wb, sheet, data, headers, groups, title, note, widths) {
+  addWorksheet(wb, sheet, gridLines = FALSE)
+  writeData(wb, sheet, title, startRow = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = seq_len(ncol(data)), rows = 1)
+  addStyle(wb, sheet, group_style, rows = 1, cols = 1)
+  names(data) <- unname(headers)
+  writeData(wb, sheet, data, startRow = 3, headerStyle = header_style)
+  addStyle(wb, sheet, group_style, rows = groups + 3,
+           cols = seq_len(ncol(data)), gridExpand = TRUE, stack = TRUE)
+  setColWidths(wb, sheet, cols = seq_len(ncol(data)), widths = widths)
+  setRowHeights(wb, sheet, rows = 3, heights = 36)
+  setRowHeights(wb, sheet, rows = 4:(nrow(data) + 3), heights = 22)
+  note_row <- nrow(data) + 5
+  writeData(wb, sheet, note, startRow = note_row, colNames = FALSE)
+  mergeCells(wb, sheet, cols = seq_len(ncol(data)), rows = note_row)
+  addStyle(wb, sheet, note_style_xlsx, rows = note_row, cols = 1)
+  setRowHeights(wb, sheet, rows = note_row, heights = 105)
+  freezePane(wb, sheet, firstActiveRow = 4, firstActiveCol = 2)
+  pageSetup(wb, sheet, orientation = "landscape", paperSize = 9,
+            fitToWidth = TRUE, fitToHeight = FALSE)
+}
+excel_headers1 <- c(Comparison = "Variable or contrast",
+                    Never_HR_CI = "Never Dibao HR (95% CI)",
+                    Never_p = "Never Dibao p",
+                    Ever_HR_CI = "Ever Dibao HR (95% CI)",
+                    Ever_p = "Ever Dibao p")
+add_presentation(wb, "Table 1", table1, excel_headers1, group_rows1,
+                  title1, note1, c(48, 29, 17, 29, 17))
+add_presentation(wb, "Table 2", table2, headers2, group_rows2,
+                  title2, note2, c(48, 29, 29, 29, 15, 15))
+
+numeric_tables <- list(A1_numeric = a1_numeric, A2_numeric = a2_numeric)
+source_notes <- c(
+  A1_numeric = "Sources: A_Never_Dibao_Hukou.xlsx and A_Ever Dibao_Hukou.xlsx, Main_Cox.",
+  A2_numeric = "Source: A_Dibao_Interaction_Hukou.xlsx, Primary_Level_HRs and Primary_Block."
+)
+for (sheet in names(numeric_tables)) {
+  data <- numeric_tables[[sheet]]
+  addWorksheet(wb, sheet, gridLines = FALSE)
+  writeData(wb, sheet, source_notes[sheet], startRow = 1, colNames = FALSE)
+  writeData(wb, sheet, data, startRow = 3, headerStyle = header_style)
+  numeric_cols <- which(vapply(data, is.numeric, logical(1)))
+  addStyle(wb, sheet, number_style, rows = 4:(nrow(data) + 3),
+           cols = numeric_cols, gridExpand = TRUE)
+  p_cols <- grep("_p$", names(data))
+  addStyle(wb, sheet, p_style, rows = 4:(nrow(data) + 3),
+           cols = p_cols, gridExpand = TRUE, stack = TRUE)
+  setColWidths(wb, sheet, cols = 1:3, widths = c(23, 52, 38))
+  setColWidths(wb, sheet, cols = 4:ncol(data), widths = 22)
+  setRowHeights(wb, sheet, rows = 3, heights = 42)
+  freezePane(wb, sheet, firstActiveRow = 4, firstActiveCol = 3)
+}
+excel_file <- file.path(output_dir, "Model_A_tables.xlsx")
+saveWorkbook(wb, excel_file, overwrite = TRUE)
+message("Saved Word tables: ", normalizePath(word_file))
+message("Saved Excel tables: ", normalizePath(excel_file))
+```
+
+
+```{r}
+# Model B1-1 to B1-4 and Model B2 supplementary tables
+# Run this entire script in RStudio with Source.
+# Results are organised from the fitted-model Excel exports, without refitting.
+# Input filenames below contain no extra parenthesised suffixes.
+
+# 1. File locations --------------------------------------------------------
+data_dir <- "/Users/apple/Desktop/Bag/rolling/Postgraduate/ADV/Week 4/data"
+output_dir <- file.path(getwd(), "outputs")
+
+# Optional command-line use:
+# Rscript Model_B_tables.R "/path/to/data" "/path/to/output"
+arguments <- commandArgs(trailingOnly = TRUE)
+if (length(arguments) >= 1) data_dir <- arguments[1]
+if (length(arguments) >= 2) output_dir <- arguments[2]
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+ever_file <- file.path(data_dir, "Model B1_Ever_ADL_IADL_Cox_results.xlsx")
+never_file <- file.path(data_dir, "Model B1_Never_ADL_IADL_Cox_results.xlsx")
+interaction_file <- file.path(data_dir, "B_Interaction_outputs",
+                               "Model B2_Dibao_Interaction_results.xlsx")
+stopifnot(file.exists(ever_file), file.exists(never_file),
+          file.exists(interaction_file))
+
+# 2. Packages --------------------------------------------------------------
+packages <- c("readxl", "officer", "flextable", "openxlsx")
+local_library <- file.path(getwd(), "work", "R-library")
+dir.create(local_library, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(local_library, .libPaths()))
+missing_packages <- packages[
+  !vapply(packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org",
+                   lib = local_library)
+}
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(paste("Package could not be loaded:", pkg,
+               "Please check the installation message above."))
+  }
+}
+library(readxl)
+library(officer)
+library(flextable)
+library(openxlsx)
+
+# 3. Read the numeric source results ---------------------------------------
+ever_full <- as.data.frame(read_excel(ever_file, sheet = "Full_Cox_Results"))
+never_full <- as.data.frame(read_excel(never_file, sheet = "Full_Cox_Results"))
+ever_sample <- as.data.frame(read_excel(ever_file, sheet = "Model_Comparison"))
+never_sample <- as.data.frame(read_excel(never_file, sheet = "Model_Comparison"))
+b2 <- as.data.frame(read_excel(interaction_file, sheet = "Primary_Level_HRs"))
+blocks <- as.data.frame(read_excel(interaction_file, sheet = "Primary_Block"))
+samples <- as.data.frame(read_excel(interaction_file, sheet = "Sample_Summary"))
+sample_check <- as.data.frame(
+  read_excel(interaction_file, sheet = "Phase1_B1_Check")
+)
+
+# Original_M1 is Model A on its original sample; it is not B1-1.
+model_codes <- c("Common_M1", "M2_ADL", "M3_IADL", "M4_ADL_IADL")
+model_labels <- c("B1-1", "B1-2", "B1-3", "B1-4")
+model_descriptions <- c("Sociodemographic factors on the common sample",
+                        "Sociodemographic factors and ADL",
+                        "Sociodemographic factors and IADL",
+                        "Sociodemographic factors with ADL and IADL")
+
+# Check that the four B1 models and B2 use the same group-specific samples.
+stopifnot(nrow(samples) == 2, nrow(sample_check) == 2,
+          setequal(samples$group, c("Never", "Ever")),
+          all(sample_check$status == "PASS"),
+          all(sample_check$B1_workbook_found))
+for (group in c("Never", "Ever")) {
+  comparison <- if (group == "Never") never_sample else ever_sample
+  stopifnot(!anyDuplicated(comparison$Model),
+            all(model_codes %in% comparison$Model))
+  comparison <- comparison[match(model_codes, comparison$Model), ]
+  summary_row <- samples[samples$group == group, ]
+  stopifnot(all(comparison$Persons == summary_row$persons),
+            all(comparison$Intervals == summary_row$intervals),
+            all(comparison$Deaths == summary_row$deaths),
+            all(abs(comparison$Person_years - summary_row$person_years) < 1e-6))
+}
+
+# 4. Labels and row order ---------------------------------------------------
+factor_order <- c("sex", "income_tertile", "marriage_status",
+                  "living_children", "coresident_child", "hukou", "adl", "iadl")
+group_labels <- c(
+  sex = "Sex (reference Male)",
+  income_tertile = "Income (reference T1)",
+  marriage_status = "Marital status (reference Partnered)",
+  living_children = "Living children (reference 0)",
+  coresident_child = "Child coresidence (reference No)",
+  hukou = "Hukou (reference Non-agricultural)",
+  adl = "ADL", iadl = "IADL"
+)
+labels1 <- data.frame(
+  factor = c("sex", rep("income_tertile", 2), rep("marriage_status", 3),
+             rep("living_children", 4), rep("coresident_child", 2),
+             "hukou", "adl", "iadl"),
+  term = c("sexFemale", "income_tertileT2", "income_tertileT3",
+           "marriage_statusWidowed", "marriage_statusSeparated-Divorced",
+           "marriage_statusNever married", "living_children1",
+           "living_children2", "living_children3+", "living_childrenUnknown",
+           "coresident_childYes", "coresident_childUnknown",
+           "hukouAgricultural", "adl", "iadl"),
+  label = c("Female", "T2", "T3", "Widowed", "Separated/Divorced",
+            "Never married", "1 child", "2 children", "3+ children", "Unknown",
+            "Yes", "Unknown", "Agricultural",
+            "Per 1-point increase", "Per 1-point increase"),
+  stringsAsFactors = FALSE
+)
+labels2 <- data.frame(
+  factor = c("sex", rep("income_tertile", 2), rep("marriage_status", 3),
+             rep("living_children", 3), "coresident_child", "hukou", "adl", "iadl"),
+  comparison = c("Female vs Male", "T2 vs T1", "T3 vs T1",
+                 "Widowed vs Partnered", "Separated-Divorced vs Partnered",
+                 "Never married vs Partnered", "1 vs 0", "2 vs 0", "3+ vs 0",
+                 "Yes vs No", "Agricultural vs Non-agricultural",
+                 "ADL per 1 point", "IADL per 1 point"),
+  label = c("Female", "T2", "T3", "Widowed", "Separated/Divorced",
+            "Never married", "1 child", "2 children", "3+ children",
+            "Yes", "Agricultural", "Per 1-point increase", "Per 1-point increase"),
+  stringsAsFactors = FALSE
+)
+model_terms <- list(labels1$term[1:13], labels1$term[1:14],
+                    labels1$term[c(1:13, 15)], labels1$term)
+
+# 5. Numeric checks and display formats ------------------------------------
+check_cox <- function(data) {
+  columns <- c("beta", "robust_se", "HR", "lower_95", "upper_95", "p_value")
+  stopifnot(all(columns %in% names(data)),
+            all(is.finite(as.matrix(data[columns]))),
+            all(data$robust_se > 0), all(data$lower_95 > 0),
+            all(data$lower_95 <= data$HR), all(data$HR <= data$upper_95),
+            all(data$p_value >= 0 & data$p_value <= 1),
+            isTRUE(all.equal(data$HR, exp(data$beta), tolerance = 1e-7)))
+}
+format_hr <- function(hr, lower, upper) {
+  sprintf("%.3f (%.3f-%.3f)", hr, lower, upper)
+}
+format_p <- function(p) {
+  result <- sprintf("%.3f", p)
+  near_cutoff <- p >= 0.045 & p <= 0.055
+  result[near_cutoff] <- sprintf("%.4f", p[near_cutoff])
+  result[p < 0.001] <- "<.001"
+  sub("^0", "", result)
+}
+
+# 6. Four B1 tables with Never on the left and Ever on the right -------------
+tables <- list()
+group_rows <- list()
+b1_numeric <- data.frame()
+for (m in seq_along(model_codes)) {
+  code <- model_codes[m]
+  label <- model_labels[m]
+  terms <- model_terms[[m]]
+  labels <- labels1[match(terms, labels1$term), ]
+  never <- never_full[never_full$Model == code, ]
+  ever <- ever_full[ever_full$Model == code, ]
+  stopifnot(!anyDuplicated(never$term), !anyDuplicated(ever$term),
+            setequal(never$term, terms), setequal(ever$term, terms))
+  never <- never[match(terms, never$term), ]
+  ever <- ever[match(terms, ever$term), ]
+  check_cox(never)
+  check_cox(ever)
+
+  numeric_data <- data.frame(
+    Model = label, Source_model = code, Factor = labels$factor,
+    Comparison = labels$label, Term = terms,
+    Never_beta = never$beta, Never_robust_se = never$robust_se,
+    Never_HR = never$HR, Never_lower_95 = never$lower_95,
+    Never_upper_95 = never$upper_95, Never_p = never$p_value,
+    Ever_beta = ever$beta, Ever_robust_se = ever$robust_se,
+    Ever_HR = ever$HR, Ever_lower_95 = ever$lower_95,
+    Ever_upper_95 = ever$upper_95, Ever_p = ever$p_value,
+    stringsAsFactors = FALSE
+  )
+  b1_numeric <- rbind(b1_numeric, numeric_data)
+  display <- data.frame(
+    Comparison = paste0("  ", labels$label),
+    Never_HR_CI = format_hr(never$HR, never$lower_95, never$upper_95),
+    Never_p = format_p(never$p_value),
+    Ever_HR_CI = format_hr(ever$HR, ever$lower_95, ever$upper_95),
+    Ever_p = format_p(ever$p_value), stringsAsFactors = FALSE
+  )
+  table <- display[0, ]
+  groups <- integer()
+  for (factor_name in factor_order[factor_order %in% labels$factor]) {
+    groups <- c(groups, nrow(table) + 1L)
+    heading <- data.frame(Comparison = unname(group_labels[factor_name]),
+                          Never_HR_CI = "", Never_p = "",
+                          Ever_HR_CI = "", Ever_p = "")
+    table <- rbind(table, heading, display[labels$factor == factor_name, ])
+  }
+  tables[[label]] <- table
+  group_rows[[label]] <- groups
+}
+
+# 7. B2 primary interaction table -----------------------------------------
+stopifnot(all(b2$analysis == "Primary_Substantive"),
+          all(blocks$analysis == "Primary_Substantive"),
+          all(blocks$status == "OK"),
+          !anyDuplicated(b2$comparison), !anyDuplicated(blocks$factor),
+          setequal(b2$comparison, labels2$comparison),
+          setequal(blocks$factor, factor_order))
+b2 <- b2[match(labels2$comparison, b2$comparison), ]
+blocks <- blocks[match(factor_order, blocks$factor), ]
+stopifnot(identical(b2$factor, labels2$factor))
+b2_columns <- c("Never_HR", "Never_lower_95", "Never_upper_95", "Never_p",
+                "Ever_HR", "Ever_lower_95", "Ever_upper_95", "Ever_p",
+                "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+                "interaction_p")
+stopifnot(all(is.finite(as.matrix(b2[b2_columns]))),
+          all(is.finite(as.matrix(blocks[c("chisq", "df", "p_value", "holm_p")]))),
+          all(blocks$p_value >= 0 & blocks$p_value <= 1),
+          all(b2$interaction_p >= 0 & b2$interaction_p <= 1),
+          isTRUE(all.equal(b2$HR_ratio_Ever_vs_Never,
+                           b2$Ever_HR / b2$Never_HR, tolerance = 1e-7)),
+          isTRUE(all.equal(blocks$holm_p, p.adjust(blocks$p_value, "holm"),
+                           tolerance = 1e-7)))
+for (group in c("Never", "Ever")) {
+  stopifnot(all(b2[[paste0(group, "_lower_95")]] > 0),
+            all(b2[[paste0(group, "_lower_95")]] <= b2[[paste0(group, "_HR")]]),
+            all(b2[[paste0(group, "_HR")]] <= b2[[paste0(group, "_upper_95")]]),
+            all(b2[[paste0(group, "_p")]] >= 0 & b2[[paste0(group, "_p")]] <= 1))
+}
+stopifnot(all(b2$ratio_lower_95 > 0),
+          all(b2$ratio_lower_95 <= b2$HR_ratio_Ever_vs_Never),
+          all(b2$HR_ratio_Ever_vs_Never <= b2$ratio_upper_95))
+b2_display <- data.frame(
+  Comparison = paste0("  ", labels2$label),
+  Never_HR_CI = format_hr(b2$Never_HR, b2$Never_lower_95, b2$Never_upper_95),
+  Ever_HR_CI = format_hr(b2$Ever_HR, b2$Ever_lower_95, b2$Ever_upper_95),
+  RHR_CI = format_hr(b2$HR_ratio_Ever_vs_Never,
+                     b2$ratio_lower_95, b2$ratio_upper_95),
+  Contrast_p = format_p(b2$interaction_p), Overall_p = "",
+  stringsAsFactors = FALSE
+)
+table <- b2_display[0, ]
+groups <- integer()
+for (factor_name in factor_order) {
+  groups <- c(groups, nrow(table) + 1L)
+  heading <- data.frame(
+    Comparison = unname(group_labels[factor_name]),
+    Never_HR_CI = "", Ever_HR_CI = "", RHR_CI = "", Contrast_p = "",
+    Overall_p = format_p(blocks$p_value[blocks$factor == factor_name])
+  )
+  table <- rbind(table, heading, b2_display[labels2$factor == factor_name, ])
+}
+tables[["B2"]] <- table
+group_rows[["B2"]] <- groups
+
+# 8. Titles, notes and column labels ---------------------------------------
+titles <- c(paste("Table", model_labels, model_descriptions),
+             "Table B2 Model B2 between-group differences in mortality associations")
+names(titles) <- names(tables)
+sample_note <- sprintf(
+  "Never Dibao: %s respondents and %s deaths. Ever Dibao: %s respondents and %s deaths.",
+  format(samples$persons[samples$group == "Never"], big.mark = ","),
+  format(samples$deaths[samples$group == "Never"], big.mark = ","),
+  format(samples$persons[samples$group == "Ever"], big.mark = ","),
+  format(samples$deaths[samples$group == "Ever"], big.mark = ",")
+)
+adjustment_notes <- c(
+  "B1-1 included the six sociodemographic factors.",
+  "B1-2 additionally included ADL.",
+  "B1-3 additionally included IADL.",
+  "B1-4 additionally included both ADL and IADL."
+)
+notes <- character(5)
+for (m in seq_along(model_codes)) {
+  notes[m] <- paste(
+    sample_note, "HR = hazard ratio. CI = confidence interval.",
+    "All B1 models used a common sample with ADL and IADL observed at interval start.",
+    adjustment_notes[m],
+    "Separate Cox models were stratified by age group; standard errors were clustered by individual.",
+    "Unknown child-number and coresidence categories were retained as adjustment terms."
+  )
+  if (m > 1) notes[m] <- paste(notes[m], "Functional-score HRs represent a one-point increase.")
+}
+notes[5] <- paste(
+  sample_note, "HR = hazard ratio. CI = confidence interval. RHR = Ever Dibao HR / Never Dibao HR.",
+  "Each model tested one factor's interaction with Dibao group, adjusting for all eight factors.",
+  "Baseline hazards were stratified by age group and Dibao group; other factor coefficients were shared.",
+  "Standard errors were clustered by individual. Functional-score HRs represent a one-point increase.",
+  "Contrast p is category-specific; overall p is the factor-level Wald test.",
+  "Displayed p values are unadjusted. Holm-adjusted overall p values are retained in the Excel B2_tests sheet.",
+  "Unknown categories were adjustment terms without group interactions."
+)
+names(notes) <- names(tables)
+headers1 <- c(Comparison = "Variable or contrast", Never_HR_CI = "HR (95% CI)",
+              Never_p = "p", Ever_HR_CI = "HR (95% CI)", Ever_p = "p")
+headers2 <- c(Comparison = "Variable or contrast",
+              Never_HR_CI = "Never Dibao\nHR (95% CI)",
+              Ever_HR_CI = "Ever Dibao\nHR (95% CI)",
+              RHR_CI = "Ever/Never\nRHR (95% CI)",
+              Contrast_p = "Contrast\np", Overall_p = "Overall\np")
+excel_headers1 <- c(Comparison = "Variable or contrast",
+                    Never_HR_CI = "Never Dibao HR (95% CI)", Never_p = "Never Dibao p",
+                    Ever_HR_CI = "Ever Dibao HR (95% CI)", Ever_p = "Ever Dibao p")
+
+# 9. Editable Word tables --------------------------------------------------
+make_word_table <- function(data, headers, groups, widths) {
+  ft <- flextable(data)
+  ft <- set_header_labels(ft, values = as.list(headers))
+  ft <- theme_booktabs(ft)
+  ft <- font(ft, fontname = "Times New Roman", part = "all")
+  ft <- fontsize(ft, size = 12, part = "all")
+  ft <- color(ft, color = "black", part = "all")
+  ft <- bold(ft, part = "header")
+  ft <- bold(ft, i = groups, part = "body")
+  ft <- align(ft, align = "center", part = "all")
+  ft <- align(ft, j = 1, align = "left", part = "all")
+  ft <- valign(ft, valign = "center", part = "all")
+  ft <- padding(ft, padding = 0.75, part = "all")
+  ft <- height(ft, height = 0.22, part = "body")
+  ft <- hrule(ft, rule = "auto", part = "body")
+  ft <- width(ft, j = seq_along(widths), width = widths)
+  ft <- set_table_properties(ft, layout = "fixed", align = "center",
+                            opts_word = list(split = FALSE))
+  paginate(ft, init = FALSE, hdr_ftr = TRUE)
+}
+title_style <- fp_text(font.family = "Times New Roman", font.size = 12, bold = TRUE)
+note_style <- fp_text(font.family = "Times New Roman", font.size = 12)
+doc <- read_docx()
+doc <- body_set_default_section(doc, prop_section(
+  page_size = page_size(orient = "landscape"),
+  page_margins = page_mar(top = 0.5, bottom = 0.5, left = 0.65, right = 0.65)
+))
+for (label in names(tables)) {
+  if (label != names(tables)[1]) doc <- body_add_break(doc)
+  if (label == "B2") {
+    ft <- make_word_table(tables[[label]], headers2, group_rows[[label]],
+                           c(3.0, 1.75, 1.75, 1.75, 0.85, 0.85))
+  } else {
+    ft <- make_word_table(tables[[label]], headers1, group_rows[[label]],
+                           c(3.5, 2.3, 0.8, 2.3, 0.8))
+    ft <- add_header_row(ft, values = c("", "Never Dibao", "Ever Dibao"),
+                         colwidths = c(1, 2, 2), top = TRUE)
+    ft <- bold(ft, part = "header")
+    ft <- align(ft, align = "center", part = "header")
+    ft <- align(ft, j = 1, align = "left", part = "header")
+    ft <- italic(ft, j = c(3, 5), i = 2, part = "header")
+  }
+  doc <- body_add_fpar(doc, fpar(ftext(titles[label], title_style),
+                                fp_p = fp_par(keep_with_next = TRUE)))
+  doc <- body_add_flextable(doc, ft)
+  doc <- body_add_fpar(doc, fpar(ftext(notes[label], note_style),
+                                fp_p = fp_par(line_spacing = 1)))
+}
+word_file <- file.path(output_dir, "Model_B_tables.docx")
+print(doc, target = word_file)
+
+# 10. Excel presentation tables and unrounded numeric results ---------------
+wb <- createWorkbook()
+modifyBaseFont(wb, fontSize = 12, fontName = "Times New Roman")
+header_style <- createStyle(textDecoration = "bold", halign = "center",
+                             valign = "center", wrapText = TRUE, border = "bottom")
+group_style <- createStyle(textDecoration = "bold")
+note_style_xlsx <- createStyle(wrapText = TRUE, valign = "top")
+p_style <- createStyle(numFmt = "0.000000E+00")
+number_style <- createStyle(numFmt = "0.000000")
+for (label in names(tables)) {
+  data <- tables[[label]]
+  names(data) <- if (label == "B2") unname(headers2) else unname(excel_headers1)
+  widths <- if (label == "B2") c(48, 29, 29, 29, 15, 15) else c(48, 29, 17, 29, 17)
+  addWorksheet(wb, label, gridLines = FALSE)
+  writeData(wb, label, titles[label], startRow = 1, colNames = FALSE)
+  mergeCells(wb, label, cols = seq_len(ncol(data)), rows = 1)
+  addStyle(wb, label, group_style, rows = 1, cols = 1)
+  writeData(wb, label, data, startRow = 3, headerStyle = header_style)
+  addStyle(wb, label, group_style, rows = group_rows[[label]] + 3,
+           cols = seq_len(ncol(data)), gridExpand = TRUE, stack = TRUE)
+  setColWidths(wb, label, cols = seq_len(ncol(data)), widths = widths)
+  setRowHeights(wb, label, rows = 3, heights = 36)
+  setRowHeights(wb, label, rows = 4:(nrow(data) + 3), heights = 22)
+  note_row <- nrow(data) + 5
+  writeData(wb, label, notes[label], startRow = note_row, colNames = FALSE)
+  mergeCells(wb, label, cols = seq_len(ncol(data)), rows = note_row)
+  addStyle(wb, label, note_style_xlsx, rows = note_row, cols = 1)
+  setRowHeights(wb, label, rows = note_row, heights = 125)
+  freezePane(wb, label, firstActiveRow = 4, firstActiveCol = 2)
+  pageSetup(wb, label, orientation = "landscape", paperSize = 9,
+            fitToWidth = TRUE, fitToHeight = FALSE)
+}
+numeric_tables <- list(B1_numeric = b1_numeric, B2_numeric = b2, B2_tests = blocks)
+source_notes <- c(
+  B1_numeric = paste("Sources: Model B1_Never_ADL_IADL_Cox_results.xlsx and",
+                      "Model B1_Ever_ADL_IADL_Cox_results.xlsx; Full_Cox_Results."),
+  B2_numeric = "Source: Model B2_Dibao_Interaction_results.xlsx; Primary_Level_HRs.",
+  B2_tests = paste("Source: Model B2_Dibao_Interaction_results.xlsx; Primary_Block.",
+                    "holm_p is adjusted across the eight primary factor-level tests.")
+)
+for (sheet in names(numeric_tables)) {
+  data <- numeric_tables[[sheet]]
+  addWorksheet(wb, sheet, gridLines = FALSE)
+  writeData(wb, sheet, source_notes[sheet], startRow = 1, colNames = FALSE)
+  writeData(wb, sheet, data, startRow = 3, headerStyle = header_style)
+  numeric_cols <- which(vapply(data, is.numeric, logical(1)))
+  addStyle(wb, sheet, number_style, rows = 4:(nrow(data) + 3),
+           cols = numeric_cols, gridExpand = TRUE)
+  p_cols <- grep("(_p$|^p_value$)", names(data))
+  addStyle(wb, sheet, p_style, rows = 4:(nrow(data) + 3),
+           cols = p_cols, gridExpand = TRUE, stack = TRUE)
+  setColWidths(wb, sheet, cols = seq_len(ncol(data)), widths = 23)
+  if (sheet == "B1_numeric") setColWidths(wb, sheet, cols = 4:5, widths = c(30, 43))
+  if (sheet == "B2_numeric") setColWidths(wb, sheet, cols = 3, widths = 43)
+  setRowHeights(wb, sheet, rows = 3, heights = 42)
+  freezePane(wb, sheet, firstActiveRow = 4, firstActiveCol = 3)
+}
+excel_file <- file.path(output_dir, "Model_B_tables.xlsx")
+saveWorkbook(wb, excel_file, overwrite = TRUE)
+message("Saved Word tables: ", normalizePath(word_file))
+message("Saved Excel tables: ", normalizePath(excel_file))
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+

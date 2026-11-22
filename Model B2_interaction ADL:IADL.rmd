@@ -1,0 +1,4554 @@
+---
+title: "B_interaction test"
+author: "Haoran Hao"
+date: "2026-09-17"
+output: html_document
+---
+
+```{r}
+# 0. Settings and packages
+# ----------------------------------------------------------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "B_Interaction_outputs")
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+options(stringsAsFactors = FALSE)
+
+waves <- c(2011, 2013, 2015, 2018, 2020)
+start_waves <- c(2011, 2013, 2015, 2018)
+next_wave_lookup <- c("2011" = 2013,
+                      "2013" = 2015,
+                      "2015" = 2018,
+                      "2018" = 2020)
+
+input_files <- setNames(
+  file.path(DATA_DIR, paste0("CHARLS_", waves, "_cleaned.csv")),
+  waves
+)
+
+if (any(!file.exists(input_files))) {
+  stop("Missing input file(s): ",
+       paste(names(input_files)[!file.exists(input_files)], collapse = ", "))
+}
+```
+
+
+```{r}
+# 1. Helper functions
+# ----------------------------------------------------------------------------
+safe_numeric <- function(x) suppressWarnings(as.numeric(x))
+
+one_nonmissing <- function(x) {
+  x <- unique(x[!is.na(x)])
+  if (length(x) == 0) return(NA)
+  x[1]
+}
+
+standardize_2011_individual_id <- function(x) {
+  x <- as.character(x)
+  out <- x
+  idx <- !is.na(x) & nchar(x) == 11
+  out[idx] <- paste0(substr(x[idx], 1, 9), "0", substr(x[idx], 10, 11))
+  out
+}
+
+standardize_2011_household_id <- function(x) {
+  x <- as.character(x)
+  out <- x
+  idx <- !is.na(x) & nchar(x) == 9
+  out[idx] <- paste0(x[idx], "0")
+  out
+}
+
+recode_marriage <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[x %in% c(1, 2, 7)] <- "Partnered"
+  out[x == 5] <- "Widowed"
+  out[x %in% c(3, 4)] <- "Separated-Divorced"
+  out[x == 6] <- "Never married"
+  factor(out,
+         levels = c("Partnered", "Widowed", "Separated-Divorced",
+                    "Never married", "Unknown"))
+}
+
+recode_children <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[!is.na(x) & x == 0] <- "0"
+  out[!is.na(x) & x == 1] <- "1"
+  out[!is.na(x) & x == 2] <- "2"
+  out[!is.na(x) & x >= 3] <- "3+"
+  factor(out, levels = c("0", "1", "2", "3+", "Unknown"))
+}
+
+recode_coresidence <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[!is.na(x) & x == 0] <- "No"
+  out[!is.na(x) & x == 1] <- "Yes"
+  factor(out, levels = c("No", "Yes", "Unknown"))
+}
+
+recode_age_group <- function(x) {
+  cut(x,
+      breaks = c(45, 55, 65, 75, 85, 95, Inf),
+      right = FALSE,
+      labels = c("45-54", "55-64", "65-74",
+                 "75-84", "85-94", "95+"))
+}
+
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = unique(warnings_seen))
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(fit, transform = "km", terms = TRUE, global = TRUE),
+    error = function(e) structure(
+      list(message = conditionMessage(e)),
+      class = "cox_zph_error"
+    )
+  )
+}
+
+get_global_ph_p <- function(ph_object) {
+  if (inherits(ph_object, "cox_zph_error")) return(NA_real_)
+  tab <- as.data.frame(ph_object$table)
+  if (!("GLOBAL" %in% rownames(tab))) return(NA_real_)
+  p_col <- if ("p" %in% names(tab)) "p" else names(tab)[ncol(tab)]
+  as.numeric(tab["GLOBAL", p_col])
+}
+
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(chisq = NA_real_, df = 0L, p_value = NA_real_,
+                      status = "No interaction coefficients found"))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    return(data.frame(chisq = NA_real_, df = length(coefficient_names),
+                      p_value = NA_real_,
+                      status = "Non-finite coefficient/variance; inspect sparse cells"))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(chisq = NA_real_, df = 0L, p_value = NA_real_,
+                      status = "Robust covariance block has rank 0"))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = pchisq(W, df = df, lower.tail = FALSE),
+    status = ifelse(df < length(coefficient_names),
+                    "Reduced-rank robust Wald test", "OK")
+  )
+}
+
+single_coef_stats <- function(fit, term) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  if (!(term %in% names(b)) ||
+      !is.finite(b[term]) ||
+      !is.finite(V[term, term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  # unname() is essential here. coef(fit)[term] keeps the coefficient
+  # name; without unname(), c(est = est, ...) creates names such as
+  # "est.sexFemale" rather than "est", so downstream stats["est"] returns NA.
+  est <- unname(b[term])
+  se <- unname(sqrt(V[term, term]))
+  p <- unname(2 * pnorm(abs(est / se), lower.tail = FALSE))
+  c(est = est, se = se, p = p)
+}
+
+linear_combination_stats <- function(fit, weights) {
+  b <- coef(fit)
+  V <- vcov(fit)
+  needed <- names(weights)
+
+  if (any(!(needed %in% names(b))) ||
+      any(!is.finite(b[needed])) ||
+      any(!is.finite(V[needed, needed, drop = FALSE]))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  w <- rep(0, length(b))
+  names(w) <- names(b)
+  w[needed] <- weights
+
+  est <- unname(sum(w * b))
+  se <- unname(sqrt(as.numeric(t(w) %*% V %*% w)))
+  p <- unname(2 * pnorm(abs(est / se), lower.tail = FALSE))
+  c(est = est, se = se, p = p)
+}
+
+hr_ci <- function(stats) {
+  # unname() is required here for the same reason as in single_coef_stats().
+  # Without it, c(HR = exp(est)) can create a name such as "HR.est",
+  # so downstream extraction with x["HR"] returns NA.
+  est <- unname(stats["est"])
+  se <- unname(stats["se"])
+  if (!is.finite(est) || !is.finite(se)) {
+    return(c(HR = NA_real_, lower_95 = NA_real_, upper_95 = NA_real_))
+  }
+  c(HR = unname(exp(est)),
+    lower_95 = unname(exp(est - 1.96 * se)),
+    upper_95 = unname(exp(est + 1.96 * se)))
+}
+
+safe_name <- function(x) {
+  z <- gsub("[^A-Za-z0-9]+", "_", x)
+  gsub("_+$", "", z)
+}
+
+# ----------------------------------------------------------------------------
+# 2. Read and standardize the five cleaned files
+# ----------------------------------------------------------------------------
+raw_list <- list()
+
+for (yr in waves) {
+  d <- read.csv(
+    input_files[as.character(yr)],
+    stringsAsFactors = FALSE,
+    na.strings = c("", "NA"),
+    colClasses = c(individual_id = "character",
+                   household_id = "character",
+                   community_id = "character"),
+    check.names = FALSE
+  )
+
+  required_now <- c(
+    "individual_id", "household_id", "community_id",
+    "sex", "age", "marriage_status_raw",
+    paste0("death_", yr), paste0("dibao_", yr),
+    "num_children", "coresident_child",
+    "household_income_per_capita"
+  )
+
+  missing_now <- setdiff(required_now, names(d))
+  if (length(missing_now) > 0) {
+    stop("Year ", yr, " is missing required column(s): ",
+         paste(missing_now, collapse = ", "))
+  }
+
+  d$individual_id <- trimws(d$individual_id)
+  d$household_id <- trimws(d$household_id)
+  d$community_id <- trimws(d$community_id)
+
+  if (yr == 2011) {
+    d$individual_id <- standardize_2011_individual_id(d$individual_id)
+    d$household_id <- standardize_2011_household_id(d$household_id)
+  }
+
+  if (anyDuplicated(d$individual_id)) {
+    stop("Duplicated individual_id detected after standardization in year ", yr)
+  }
+
+  raw_list[[as.character(yr)]] <- d
+}
+
+# ----------------------------------------------------------------------------
+# 3. Build standardized person-wave table
+# ----------------------------------------------------------------------------
+person_wave_list <- list()
+
+for (yr in waves) {
+  d <- raw_list[[as.character(yr)]]
+
+  get_or_na <- function(nm) {
+    if (nm %in% names(d)) d[[nm]] else rep(NA, nrow(d))
+  }
+
+  pw <- data.frame(
+    individual_id = d$individual_id,
+    household_id = d$household_id,
+    community_id = d$community_id,
+    wave = yr,
+    sex = safe_numeric(d$sex),
+    age = safe_numeric(d$age),
+    birth_year_used = safe_numeric(get_or_na("birth_year_used")),
+    marriage_status_raw = safe_numeric(d$marriage_status_raw),
+    num_children = safe_numeric(d$num_children),
+    coresident_child_raw = safe_numeric(d$coresident_child),
+    death = safe_numeric(d[[paste0("death_", yr)]]),
+    dibao = safe_numeric(d[[paste0("dibao_", yr)]]),
+    household_income_per_capita = safe_numeric(d$household_income_per_capita),
+    death_year = safe_numeric(get_or_na("death_year")),
+    death_month = safe_numeric(get_or_na("death_month")),
+    stringsAsFactors = FALSE
+  )
+
+  if (any(!is.na(pw$sex) & !(pw$sex %in% c(1, 2)))) {
+    stop("Unexpected sex code in year ", yr)
+  }
+  if (any(!is.na(pw$death) & !(pw$death %in% c(0, 1)))) {
+    stop("Unexpected death code in year ", yr)
+  }
+  if (any(!is.na(pw$dibao) & !(pw$dibao %in% c(0, 1)))) {
+    stop("Unexpected Dibao code in year ", yr)
+  }
+  if (any(!is.na(pw$coresident_child_raw) &
+          !(pw$coresident_child_raw %in% c(0, 1)))) {
+    stop("Unexpected coresident_child code in year ", yr)
+  }
+
+  person_wave_list[[as.character(yr)]] <- pw
+}
+
+person_wave <- do.call(rbind, person_wave_list)
+person_wave <- person_wave[order(person_wave$individual_id, person_wave$wave), ]
+rownames(person_wave) <- NULL
+
+# Do not silently force household changes.
+hh_per_person <- tapply(
+  person_wave$household_id,
+  person_wave$individual_id,
+  function(z) length(unique(z[!is.na(z)]))
+)
+if (any(hh_per_person > 1)) {
+  stop("At least one individual is linked to more than one household_id. ",
+       "Inspect household linkage before modelling.")
+}
+```
+
+
+```{r}
+# 4. Household-wave Dibao history
+# ----------------------------------------------------------------------------
+check_household_value <- function(df, variable, yr) {
+  ss <- split(df[[variable]], df$household_id)
+  n_unique <- vapply(
+    ss,
+    function(z) length(unique(z[!is.na(z)])),
+    integer(1)
+  )
+  if (any(n_unique > 1)) {
+    stop("Conflicting non-missing ", variable,
+         " values within household-wave in year ", yr)
+  }
+}
+
+hh_wave_list <- list()
+
+for (yr in waves) {
+  d <- person_wave[person_wave$wave == yr, ]
+  check_household_value(d, "dibao", yr)
+  check_household_value(d, "household_income_per_capita", yr)
+
+  hh_split <- split(d, d$household_id)
+  hh_one <- lapply(hh_split, function(g) {
+    data.frame(
+      household_id = g$household_id[1],
+      wave = yr,
+      dibao = one_nonmissing(g$dibao),
+      any_alive_record = any(g$death == 0, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+  hh_wave_list[[as.character(yr)]] <- do.call(rbind, hh_one)
+}
+
+household_wave <- do.call(rbind, hh_wave_list)
+rownames(household_wave) <- NULL
+
+# Any explicit Yes -> Ever.
+# No Yes + at least one explicit No + no ambiguous observed alive wave -> Never.
+# Otherwise -> Unknown.
+hh_split <- split(household_wave, household_wave$household_id)
+
+household_history <- do.call(rbind, lapply(hh_split, function(g) {
+  any_yes <- any(g$dibao == 1, na.rm = TRUE)
+  any_no <- any(g$dibao == 0, na.rm = TRUE)
+  ambiguous_observed <- any(g$any_alive_record & is.na(g$dibao))
+
+  if (any_yes) {
+    group <- "Ever"
+    first_wave <- min(g$wave[g$dibao == 1], na.rm = TRUE)
+  } else if (any_no && !ambiguous_observed) {
+    group <- "Never"
+    first_wave <- NA_real_
+  } else {
+    group <- "Unknown"
+    first_wave <- NA_real_
+  }
+
+  data.frame(
+    household_id = g$household_id[1],
+    dibao_group = group,
+    first_dibao_wave = first_wave,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(household_history) <- NULL
+
+# ----------------------------------------------------------------------------
+# 5. Fixed sex and death time at person level
+# ----------------------------------------------------------------------------
+person_split <- split(person_wave, person_wave$individual_id)
+
+person_meta <- do.call(rbind, lapply(person_split, function(g) {
+  g <- g[order(g$wave), ]
+  sx <- g$sex[!is.na(g$sex)]
+  data.frame(
+    individual_id = g$individual_id[1],
+    household_id = g$household_id[1],
+    sex_fixed = if (length(sx) == 0) NA_real_ else sx[1],
+    sex_conflict = length(unique(sx)) > 1,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(person_meta) <- NULL
+
+death_count <- vapply(
+  person_split,
+  function(g) sum(g$death == 1, na.rm = TRUE),
+  numeric(1)
+)
+if (any(death_count > 1)) {
+  stop("At least one person has death==1 in more than one wave.")
+}
+
+death_info <- do.call(rbind, lapply(person_split, function(g) {
+  g <- g[order(g$wave), ]
+  dead_rows <- g[g$death == 1, , drop = FALSE]
+  alive_rows <- g[g$death == 0, , drop = FALSE]
+  last_alive_wave <- if (nrow(alive_rows) == 0) NA_real_ else max(alive_rows$wave)
+
+  if (nrow(dead_rows) == 0) {
+    return(data.frame(
+      individual_id = g$individual_id[1],
+      death_confirmed = 0,
+      death_report_wave = NA_real_,
+      death_time = NA_real_,
+      death_time_source = NA_character_,
+      death_time_issue = NA_character_,
+      last_alive_wave = last_alive_wave,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  d <- dead_rows[1, ]
+  report_wave <- d$wave
+  previous_alive <- alive_rows$wave[alive_rows$wave < report_wave]
+  last_alive_before_report <-
+    if (length(previous_alive) == 0) NA_real_ else max(previous_alive)
+
+  raw_time <- NA_real_
+  raw_source <- "missing"
+
+  if (!is.na(d$death_year)) {
+    if (!is.na(d$death_month) && d$death_month >= 1 && d$death_month <= 12) {
+      raw_time <- d$death_year + (d$death_month - 0.5) / 12
+      raw_source <- "reported_year_month"
+    } else {
+      raw_time <- d$death_year
+      raw_source <- "reported_year"
+    }
+  } else if (!is.na(d$birth_year_used) && !is.na(d$age)) {
+    raw_time <- d$birth_year_used + d$age
+    raw_source <- "cleaned_death_age"
+  }
+
+  valid_raw <- !is.na(raw_time) &&
+    raw_time <= report_wave &&
+    (is.na(last_alive_before_report) || raw_time > last_alive_before_report)
+
+  if (valid_raw) {
+    final_time <- raw_time
+    final_source <- raw_source
+    issue <- NA_character_
+  } else {
+    if (is.na(raw_time)) {
+      issue <- "death_time_missing"
+    } else if (raw_time > report_wave) {
+      issue <- "death_time_after_report_wave"
+    } else if (!is.na(last_alive_before_report) &&
+               raw_time <= last_alive_before_report) {
+      issue <- "death_time_not_after_last_alive"
+    } else {
+      issue <- "death_time_invalid"
+    }
+
+    if (!is.na(last_alive_before_report)) {
+      final_time <- (last_alive_before_report + report_wave) / 2
+      final_source <- "fallback_midpoint"
+    } else {
+      final_time <- report_wave
+      final_source <- "fallback_first_dead_wave"
+    }
+  }
+
+  data.frame(
+    individual_id = g$individual_id[1],
+    death_confirmed = 1,
+    death_report_wave = report_wave,
+    death_time = final_time,
+    death_time_source = final_source,
+    death_time_issue = issue,
+    last_alive_wave = last_alive_wave,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(death_info) <- NULL
+
+person_meta <- merge(person_meta, household_history,
+                     by = "household_id", all.x = TRUE, sort = FALSE)
+person_meta <- merge(person_meta, death_info,
+                     by = "individual_id", all.x = TRUE, sort = FALSE)
+
+# ----------------------------------------------------------------------------
+# 6. Construct B1 start-stop intervals
+# ----------------------------------------------------------------------------
+start_data <- person_wave[
+  person_wave$wave %in% start_waves & person_wave$death == 0,
+  , drop = FALSE
+]
+
+start_data <- merge(
+  start_data,
+  person_meta[, c(
+    "individual_id", "household_id",
+    "sex_fixed", "sex_conflict",
+    "dibao_group", "first_dibao_wave",
+    "death_confirmed", "death_report_wave",
+    "death_time", "death_time_source",
+    "death_time_issue", "last_alive_wave"
+  )],
+  by = c("individual_id", "household_id"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+start_data$next_wave <- unname(next_wave_lookup[as.character(start_data$wave)])
+start_data$observation_end <- ifelse(
+  start_data$death_confirmed == 1,
+  start_data$death_time,
+  start_data$last_alive_wave
+)
+start_data$stop <- pmin(start_data$next_wave,
+                        start_data$observation_end,
+                        na.rm = FALSE)
+
+# Event is explicitly initialized to 0 so NA cannot propagate silently.
+start_data$event <- 0L
+event_idx <-
+  !is.na(start_data$death_confirmed) &
+  start_data$death_confirmed == 1 &
+  !is.na(start_data$death_time) &
+  !is.na(start_data$stop) &
+  start_data$death_time > start_data$wave &
+  start_data$death_time <= start_data$stop
+start_data$event[event_idx] <- 1L
+
+if (anyNA(start_data$event)) {
+  stop("Internal error: event contains NA after construction.")
+}
+
+start_data$marriage_status <- recode_marriage(start_data$marriage_status_raw)
+start_data$living_children <- recode_children(start_data$num_children)
+start_data$coresident_child <- recode_coresidence(start_data$coresident_child_raw)
+start_data$age_group <- recode_age_group(start_data$age)
+start_data$sex <- factor(
+  ifelse(start_data$sex_fixed == 1, "Male",
+         ifelse(start_data$sex_fixed == 2, "Female", NA)),
+  levels = c("Male", "Female")
+)
+
+# B1 current/start-wave income. Negative values and genuine zero are retained.
+start_data$current_income_pc <- start_data$household_income_per_capita
+
+start_data$eligible_group <- start_data$dibao_group %in% c("Ever", "Never")
+start_data$eligible_age <- !is.na(start_data$age) & start_data$age >= 45
+start_data$eligible_sex <- !is.na(start_data$sex_fixed)
+start_data$eligible_income <- !is.na(start_data$current_income_pc)
+start_data$after_ever_entry <-
+  start_data$dibao_group != "Ever" |
+  (!is.na(start_data$first_dibao_wave) &
+     start_data$wave >= start_data$first_dibao_wave)
+start_data$positive_interval <- !is.na(start_data$stop) &
+  start_data$stop > start_data$wave
+
+analysis_intervals <- start_data[
+  start_data$eligible_group &
+    start_data$eligible_age &
+    start_data$eligible_sex &
+    start_data$eligible_income &
+    start_data$after_ever_entry &
+    start_data$positive_interval,
+  , drop = FALSE
+]
+
+analysis_intervals$start <- analysis_intervals$wave
+analysis_intervals$person_years <-
+  analysis_intervals$stop - analysis_intervals$start
+```
+
+
+```{r}
+# 7. B1 wave-specific common income tertiles
+# ----------------------------------------------------------------------------
+cutoff_list <- list()
+
+for (yr in start_waves) {
+  h <- unique(
+    analysis_intervals[
+      analysis_intervals$start == yr,
+      c("household_id", "current_income_pc")
+    ]
+  )
+  h <- h[!is.na(h$current_income_pc), , drop = FALSE]
+
+  if (nrow(h) == 0) {
+    stop("No eligible households for B1 income cutoff in wave ", yr)
+  }
+
+  q <- quantile(
+    h$current_income_pc,
+    probs = c(1/3, 2/3),
+    na.rm = TRUE,
+    type = 7,
+    names = FALSE
+  )
+
+  cutoff_list[[as.character(yr)]] <- data.frame(
+    start_wave = yr,
+    q1_T1_T2 = q[1],
+    q2_T2_T3 = q[2],
+    unique_households = nrow(h),
+    stringsAsFactors = FALSE
+  )
+}
+
+wave_income_cutoffs <- do.call(rbind, cutoff_list)
+rownames(wave_income_cutoffs) <- NULL
+
+analysis_intervals$income_tertile <- NA_character_
+
+for (yr in start_waves) {
+  q1 <- wave_income_cutoffs$q1_T1_T2[
+    wave_income_cutoffs$start_wave == yr
+  ]
+  q2 <- wave_income_cutoffs$q2_T2_T3[
+    wave_income_cutoffs$start_wave == yr
+  ]
+
+  idx <- analysis_intervals$start == yr
+  inc <- analysis_intervals$current_income_pc[idx]
+
+  analysis_intervals$income_tertile[idx] <- ifelse(
+    inc <= q1, "T1",
+    ifelse(inc <= q2, "T2", "T3")
+  )
+}
+
+if (anyNA(analysis_intervals$income_tertile)) {
+  stop("Internal error: income_tertile contains NA after B1 classification.")
+}
+
+# ----------------------------------------------------------------------------
+# 8. Final common interaction sample
+# ----------------------------------------------------------------------------
+# Match the final B1 Ever and Never main models: remove marriage Unknown from
+# the fitted Cox sample, but do NOT merge it into another marital category.
+marriage_unknown_idx <-
+  !is.na(analysis_intervals$marriage_status) &
+  as.character(analysis_intervals$marriage_status) == "Unknown"
+
+marriage_unknown_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- analysis_intervals[
+    as.character(analysis_intervals$dibao_group) == gr & marriage_unknown_idx,
+    , drop = FALSE
+  ]
+  data.frame(
+    dibao_group = gr,
+    excluded_intervals = nrow(d),
+    excluded_persons = length(unique(d$individual_id)),
+    excluded_deaths = sum(d$event, na.rm = TRUE),
+    excluded_person_years = sum(d$person_years, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}))
+
+model_data <- analysis_intervals[!marriage_unknown_idx, , drop = FALSE]
+
+model_data$dibao_group <- factor(model_data$dibao_group,
+                                 levels = c("Never", "Ever"))
+model_data$sex <- factor(model_data$sex,
+                         levels = c("Male", "Female"))
+model_data$income_tertile <- factor(model_data$income_tertile,
+                                    levels = c("T1", "T2", "T3"))
+model_data$marriage_status <- factor(
+  as.character(model_data$marriage_status),
+  levels = c("Partnered", "Widowed", "Separated-Divorced", "Never married")
+)
+model_data$living_children <- factor(
+  model_data$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+model_data$coresident_child <- factor(
+  model_data$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+model_data$age_group <- factor(
+  model_data$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+required_model_vars <- c(
+  "start", "stop", "event", "individual_id", "dibao_group",
+  "sex", "income_tertile", "marriage_status",
+  "living_children", "coresident_child", "age_group"
+)
+complete_model <- complete.cases(model_data[, required_model_vars])
+if (!all(complete_model)) {
+  stop(sum(!complete_model),
+       " interaction-model interval(s) still contain missing required fields.")
+}
+if (any(model_data$stop <= model_data$start)) {
+  stop("Non-positive risk interval detected in final interaction sample.")
+}
+if (sum(model_data$event) == 0) {
+  stop("No deaths found in final interaction sample.")
+}
+
+# ----------------------------------------------------------------------------
+# 9. Compact sample summary and cell counts
+# ----------------------------------------------------------------------------
+sample_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data[as.character(model_data$dibao_group) == gr, , drop = FALSE]
+  data.frame(
+    dibao_group = gr,
+    persons = length(unique(d$individual_id)),
+    households = length(unique(d$household_id)),
+    intervals = nrow(d),
+    deaths = sum(d$event),
+    person_years = sum(d$person_years),
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Event/person counts for each comparison level, used directly in the final
+# interaction result table so sparse cells are visible without extra QA files.
+get_cell_counts <- function(variable, level, group_name) {
+  d <- model_data[
+    as.character(model_data$dibao_group) == group_name &
+      as.character(model_data[[variable]]) == level,
+    , drop = FALSE
+  ]
+  c(records = nrow(d),
+    persons = length(unique(d$individual_id)),
+    events = sum(d$event, na.rm = TRUE))
+}
+```
+
+```{r}
+# 10. Primary interaction models: one factor at a time
+# ----------------------------------------------------------------------------
+base_covariates <- c(
+  "sex",
+  "income_tertile",
+  "marriage_status",
+  "living_children",
+  "coresident_child"
+)
+
+specs <- list(
+  sex = list(reference = "Male", levels = c("Female")),
+  income_tertile = list(reference = "T1", levels = c("T2", "T3")),
+  marriage_status = list(reference = "Partnered",
+                         levels = c("Widowed", "Separated-Divorced",
+                                    "Never married")),
+  living_children = list(reference = "0",
+                         levels = c("1", "2", "3+", "Unknown")),
+  coresident_child = list(reference = "No",
+                          levels = c("Yes", "Unknown"))
+)
+
+main_coef_name <- function(variable, level) paste0(variable, level)
+
+add_interaction_columns <- function(data, variable, nonref_levels) {
+  int_names <- character(0)
+  for (lev in nonref_levels) {
+    nm <- paste0("int_", variable, "_", safe_name(lev))
+    data[[nm]] <- as.integer(
+      as.character(data$dibao_group) == "Ever" &
+        as.character(data[[variable]]) == lev
+    )
+    int_names <- c(int_names, nm)
+  }
+  list(data = data, interaction_names = int_names)
+}
+
+build_formula <- function(interaction_names) {
+  rhs <- c(base_covariates,
+           interaction_names,
+           "strata(age_group, dibao_group)")
+  as.formula(
+    paste("Surv(start, stop, event) ~", paste(rhs, collapse = " + "))
+  )
+}
+
+primary_block <- data.frame()
+primary_level <- data.frame()
+primary_warnings <- character(0)
+
+for (target in names(specs)) {
+  tmp <- add_interaction_columns(
+    model_data,
+    target,
+    specs[[target]]$levels
+  )
+  dfit <- tmp$data
+  int_names <- tmp$interaction_names
+  form <- build_formula(int_names)
+
+  fit_obj <- fit_cox_with_warnings(form, dfit)
+  fit <- fit_obj$fit
+
+  if (length(fit_obj$warnings) > 0) {
+    primary_warnings <- c(
+      primary_warnings,
+      paste0("Primary ", target, ": ", fit_obj$warnings)
+    )
+  }
+
+  block <- wald_block(fit, int_names)
+  ph <- safe_cox_zph(fit)
+  ph_global_p <- get_global_ph_p(ph)
+
+  primary_block <- rbind(
+    primary_block,
+    data.frame(
+      factor = target,
+      reference_level = specs[[target]]$reference,
+      chisq = block$chisq,
+      df = block$df,
+      p_value = block$p_value,
+      PH_global_p = ph_global_p,
+      status = block$status,
+      stringsAsFactors = FALSE
+    )
+  )
+
+  for (j in seq_along(specs[[target]]$levels)) {
+    lev <- specs[[target]]$levels[j]
+    main_term <- main_coef_name(target, lev)
+    int_term <- int_names[j]
+
+    never_stats <- single_coef_stats(fit, main_term)
+    ever_stats <- linear_combination_stats(
+      fit,
+      setNames(c(1, 1), c(main_term, int_term))
+    )
+    ratio_stats <- single_coef_stats(fit, int_term)
+
+    n_ci <- hr_ci(never_stats)
+    e_ci <- hr_ci(ever_stats)
+    r_ci <- hr_ci(ratio_stats)
+
+    never_counts <- get_cell_counts(target, lev, "Never")
+    ever_counts <- get_cell_counts(target, lev, "Ever")
+
+    primary_level <- rbind(
+      primary_level,
+      data.frame(
+        factor = target,
+        reference_level = specs[[target]]$reference,
+        level = lev,
+        Never_records = never_counts["records"],
+        Never_persons = never_counts["persons"],
+        Never_events = never_counts["events"],
+        Never_HR = n_ci["HR"],
+        Never_lower_95 = n_ci["lower_95"],
+        Never_upper_95 = n_ci["upper_95"],
+        Never_p = never_stats["p"],
+        Ever_records = ever_counts["records"],
+        Ever_persons = ever_counts["persons"],
+        Ever_events = ever_counts["events"],
+        Ever_HR = e_ci["HR"],
+        Ever_lower_95 = e_ci["lower_95"],
+        Ever_upper_95 = e_ci["upper_95"],
+        Ever_p = ever_stats["p"],
+        HR_ratio_Ever_vs_Never = r_ci["HR"],
+        ratio_lower_95 = r_ci["lower_95"],
+        ratio_upper_95 = r_ci["upper_95"],
+        interaction_p = ratio_stats["p"],
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# Attach the overall factor-level interaction test to every level row.
+primary_interaction <- merge(
+  primary_level,
+  primary_block[, c("factor", "chisq", "df", "p_value", "PH_global_p", "status")],
+  by = "factor",
+  all.x = TRUE,
+  sort = FALSE
+)
+names(primary_interaction)[names(primary_interaction) == "chisq"] <- "block_chisq"
+names(primary_interaction)[names(primary_interaction) == "df"] <- "block_df"
+names(primary_interaction)[names(primary_interaction) == "p_value"] <- "block_p"
+names(primary_interaction)[names(primary_interaction) == "status"] <- "block_status"
+
+# Preserve the intended factor order after merge.
+factor_order <- names(specs)
+primary_interaction$factor_order <- match(primary_interaction$factor, factor_order)
+primary_interaction$level_order <- ave(
+  seq_len(nrow(primary_interaction)),
+  primary_interaction$factor,
+  FUN = seq_along
+)
+primary_interaction <- primary_interaction[
+  order(primary_interaction$factor_order, primary_interaction$level_order),
+  , drop = FALSE
+]
+primary_interaction$factor_order <- NULL
+primary_interaction$level_order <- NULL
+rownames(primary_interaction) <- NULL
+
+# ----------------------------------------------------------------------------
+# 11. Full-interaction sensitivity model
+# ----------------------------------------------------------------------------
+full_data <- model_data
+full_blocks <- list()
+all_interaction_names <- character(0)
+
+for (target in names(specs)) {
+  tmp <- add_interaction_columns(
+    full_data,
+    target,
+    specs[[target]]$levels
+  )
+  full_data <- tmp$data
+  full_blocks[[target]] <- tmp$interaction_names
+  all_interaction_names <- c(all_interaction_names, tmp$interaction_names)
+}
+
+full_formula <- build_formula(all_interaction_names)
+full_fit_obj <- fit_cox_with_warnings(full_formula, full_data)
+full_fit <- full_fit_obj$fit
+full_ph <- safe_cox_zph(full_fit)
+full_ph_global_p <- get_global_ph_p(full_ph)
+
+full_sensitivity <- data.frame()
+for (target in names(specs)) {
+  block <- wald_block(full_fit, full_blocks[[target]])
+  full_sensitivity <- rbind(
+    full_sensitivity,
+    data.frame(
+      factor = target,
+      chisq = block$chisq,
+      df = block$df,
+      p_value = block$p_value,
+      PH_global_p = full_ph_global_p,
+      status = block$status,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+all_warnings <- c(primary_warnings,
+                  if (length(full_fit_obj$warnings) > 0)
+                    paste0("Full model: ", full_fit_obj$warnings)
+                  else character(0))
+warning_text <- if (length(all_warnings) == 0) {
+  "No coxph warnings captured."
+} else {
+  paste(unique(all_warnings), collapse = " | ")
+}
+
+# ----------------------------------------------------------------------------
+# 12. Compact summary sheet
+# ----------------------------------------------------------------------------
+summary_table <- data.frame(
+  item = c(
+    "Method",
+    "Income definition",
+    "Ever entry rule",
+    "Marriage Unknown handling",
+    "Never persons in fitted interaction sample",
+    "Never intervals in fitted interaction sample",
+    "Never deaths in fitted interaction sample",
+    "Never person-years in fitted interaction sample",
+    "Ever persons in fitted interaction sample",
+    "Ever intervals in fitted interaction sample",
+    "Ever deaths in fitted interaction sample",
+    "Ever person-years in fitted interaction sample",
+    "Marriage-Unknown intervals excluded from Never",
+    "Marriage-Unknown deaths excluded from Never",
+    "Marriage-Unknown intervals excluded from Ever",
+    "Marriage-Unknown deaths excluded from Ever",
+    "2011 q1 T1/T2",
+    "2011 q2 T2/T3",
+    "2013 q1 T1/T2",
+    "2013 q2 T2/T3",
+    "2015 q1 T1/T2",
+    "2015 q2 T2/T3",
+    "2018 q1 T1/T2",
+    "2018 q2 T2/T3",
+    "Full interaction model GLOBAL PH p",
+    "Model warnings"
+  ),
+  value = c(
+    "B1 pooled start-stop Cox interaction analysis",
+    "Wave-specific household per-capita income tertiles at interval start",
+    "Ever contributes only from first observed Dibao-Yes wave onward",
+    "Excluded from all fitted interaction models; not merged with other categories",
+    sample_summary$persons[sample_summary$dibao_group == "Never"],
+    sample_summary$intervals[sample_summary$dibao_group == "Never"],
+    sample_summary$deaths[sample_summary$dibao_group == "Never"],
+    round(sample_summary$person_years[sample_summary$dibao_group == "Never"], 6),
+    sample_summary$persons[sample_summary$dibao_group == "Ever"],
+    sample_summary$intervals[sample_summary$dibao_group == "Ever"],
+    sample_summary$deaths[sample_summary$dibao_group == "Ever"],
+    round(sample_summary$person_years[sample_summary$dibao_group == "Ever"], 6),
+    marriage_unknown_summary$excluded_intervals[
+      marriage_unknown_summary$dibao_group == "Never"],
+    marriage_unknown_summary$excluded_deaths[
+      marriage_unknown_summary$dibao_group == "Never"],
+    marriage_unknown_summary$excluded_intervals[
+      marriage_unknown_summary$dibao_group == "Ever"],
+    marriage_unknown_summary$excluded_deaths[
+      marriage_unknown_summary$dibao_group == "Ever"],
+    wave_income_cutoffs$q1_T1_T2[wave_income_cutoffs$start_wave == 2011],
+    wave_income_cutoffs$q2_T2_T3[wave_income_cutoffs$start_wave == 2011],
+    wave_income_cutoffs$q1_T1_T2[wave_income_cutoffs$start_wave == 2013],
+    wave_income_cutoffs$q2_T2_T3[wave_income_cutoffs$start_wave == 2013],
+    wave_income_cutoffs$q1_T1_T2[wave_income_cutoffs$start_wave == 2015],
+    wave_income_cutoffs$q2_T2_T3[wave_income_cutoffs$start_wave == 2015],
+    wave_income_cutoffs$q1_T1_T2[wave_income_cutoffs$start_wave == 2018],
+    wave_income_cutoffs$q2_T2_T3[wave_income_cutoffs$start_wave == 2018],
+    full_ph_global_p,
+    warning_text
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+
+```{r}
+# 13. Output ONLY one Excel workbook and one CSV
+# ----------------------------------------------------------------------------
+excel_file <- file.path(OUTPUT_DIR, "B_Dibao_Interaction_results.xlsx")
+csv_file <- file.path(OUTPUT_DIR, "B_Dibao_Interaction_results.csv")
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Summary")
+writeData(wb, "Summary", summary_table)
+
+addWorksheet(wb, "Primary_Interaction")
+writeData(wb, "Primary_Interaction", primary_interaction)
+
+addWorksheet(wb, "Full_Sensitivity")
+writeData(wb, "Full_Sensitivity", full_sensitivity)
+
+saveWorkbook(wb, excel_file, overwrite = TRUE)
+
+# The single CSV contains the main primary interaction results, including
+# both the overall factor block test and level-specific HR comparisons.
+write.csv(primary_interaction,
+          csv_file,
+          row.names = FALSE,
+          na = "")
+
+# ----------------------------------------------------------------------------
+# 14. Console summary
+# ----------------------------------------------------------------------------
+cat("\n============================================================\n")
+cat("B1 Dibao interaction analysis completed.\n")
+cat("Excel: ", excel_file, "\n", sep = "")
+cat("CSV:   ", csv_file, "\n", sep = "")
+cat("Never persons / intervals / deaths: ",
+    sample_summary$persons[sample_summary$dibao_group == "Never"], " / ",
+    sample_summary$intervals[sample_summary$dibao_group == "Never"], " / ",
+    sample_summary$deaths[sample_summary$dibao_group == "Never"], "\n", sep = "")
+cat("Ever persons / intervals / deaths: ",
+    sample_summary$persons[sample_summary$dibao_group == "Ever"], " / ",
+    sample_summary$intervals[sample_summary$dibao_group == "Ever"], " / ",
+    sample_summary$deaths[sample_summary$dibao_group == "Ever"], "\n", sep = "")
+cat("\nPrimary overall interaction p-values:\n")
+print(primary_block[, c("factor", "chisq", "df", "p_value", "PH_global_p")],
+      row.names = FALSE)
+cat("============================================================\n")
+```
+
+
+```{r}
+# Full runnable R code extracted from B_interaction_all_variables_Hukou_ADL_IADL.rmd
+
+# 0. Settings and packages
+# ----------------------------------------------------------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "B_Interaction_outputs")
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+options(stringsAsFactors = FALSE)
+
+waves <- c(2011, 2013, 2015, 2018, 2020)
+start_waves <- c(2011, 2013, 2015, 2018)
+next_wave_lookup <- c("2011" = 2013,
+                      "2013" = 2015,
+                      "2015" = 2018,
+                      "2018" = 2020)
+
+# Keep the existing filenames and working directory.
+# Prefer the original CSV inputs; use the same-named XLSX only if CSV is absent.
+input_csv <- file.path(DATA_DIR, paste0("CHARLS_", waves, "_cleaned.csv"))
+input_xlsx <- file.path(DATA_DIR, paste0("CHARLS_", waves, "_cleaned.xlsx"))
+input_files <- setNames(
+  ifelse(file.exists(input_csv), input_csv, input_xlsx),
+  waves
+)
+file_adl <- file.path(DATA_DIR, "CHARLS_2011_2020_wide_ADL_IADL.xlsx")
+
+if (any(!file.exists(input_files))) {
+  stop("Missing cleaned wave file(s) for: ",
+       paste(names(input_files)[!file.exists(input_files)], collapse = ", "),
+       ". Expected CHARLS_YYYY_cleaned.csv or CHARLS_YYYY_cleaned.xlsx.")
+}
+if (!file.exists(file_adl)) {
+  stop("Missing ADL/IADL file: ", file_adl)
+}
+
+
+# 1. Helper functions
+# ----------------------------------------------------------------------------
+safe_numeric <- function(x) suppressWarnings(as.numeric(x))
+
+one_nonmissing <- function(x) {
+  x <- unique(x[!is.na(x)])
+  if (length(x) == 0) return(NA)
+  x[1]
+}
+
+standardize_2011_individual_id <- function(x) {
+  x <- as.character(x)
+  out <- x
+  idx <- !is.na(x) & nchar(x) == 11
+  out[idx] <- paste0(substr(x[idx], 1, 9), "0", substr(x[idx], 10, 11))
+  out
+}
+
+standardize_2011_household_id <- function(x) {
+  x <- as.character(x)
+  out <- x
+  idx <- !is.na(x) & nchar(x) == 9
+  out[idx] <- paste0(x[idx], "0")
+  out
+}
+
+recode_marriage <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[x %in% c(1, 2, 7)] <- "Partnered"
+  out[x == 5] <- "Widowed"
+  out[x %in% c(3, 4)] <- "Separated-Divorced"
+  out[x == 6] <- "Never married"
+  factor(out,
+         levels = c("Partnered", "Widowed", "Separated-Divorced",
+                    "Never married", "Unknown"))
+}
+
+recode_children <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[!is.na(x) & x == 0] <- "0"
+  out[!is.na(x) & x == 1] <- "1"
+  out[!is.na(x) & x == 2] <- "2"
+  out[!is.na(x) & x >= 3] <- "3+"
+  factor(out, levels = c("0", "1", "2", "3+", "Unknown"))
+}
+
+recode_coresidence <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[!is.na(x) & x == 0] <- "No"
+  out[!is.na(x) & x == 1] <- "Yes"
+  factor(out, levels = c("No", "Yes", "Unknown"))
+}
+
+recode_age_group <- function(x) {
+  cut(x,
+      breaks = c(45, 55, 65, 75, 85, 95, Inf),
+      right = FALSE,
+      labels = c("45-54", "55-64", "65-74",
+                 "75-84", "85-94", "95+"))
+}
+
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = unique(warnings_seen))
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(fit, transform = "km", terms = TRUE, global = TRUE),
+    error = function(e) structure(
+      list(message = conditionMessage(e)),
+      class = "cox_zph_error"
+    )
+  )
+}
+
+get_global_ph_p <- function(ph_object) {
+  if (inherits(ph_object, "cox_zph_error")) return(NA_real_)
+  tab <- as.data.frame(ph_object$table)
+  if (!("GLOBAL" %in% rownames(tab))) return(NA_real_)
+  p_col <- if ("p" %in% names(tab)) "p" else names(tab)[ncol(tab)]
+  as.numeric(tab["GLOBAL", p_col])
+}
+
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(chisq = NA_real_, df = 0L, p_value = NA_real_,
+                      status = "No interaction coefficients found"))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    return(data.frame(chisq = NA_real_, df = length(coefficient_names),
+                      p_value = NA_real_,
+                      status = "Non-finite coefficient/variance; inspect sparse cells"))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(chisq = NA_real_, df = 0L, p_value = NA_real_,
+                      status = "Robust covariance block has rank 0"))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = pchisq(W, df = df, lower.tail = FALSE),
+    status = ifelse(df < length(coefficient_names),
+                    "Reduced-rank robust Wald test", "OK")
+  )
+}
+
+single_coef_stats <- function(fit, term) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  if (!(term %in% names(b)) ||
+      !is.finite(b[term]) ||
+      !is.finite(V[term, term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  # unname() is essential here. coef(fit)[term] keeps the coefficient
+  # name; without unname(), c(est = est, ...) creates names such as
+  # "est.sexFemale" rather than "est", so downstream stats["est"] returns NA.
+  est <- unname(b[term])
+  se <- unname(sqrt(V[term, term]))
+  p <- unname(2 * pnorm(abs(est / se), lower.tail = FALSE))
+  c(est = est, se = se, p = p)
+}
+
+linear_combination_stats <- function(fit, weights) {
+  b <- coef(fit)
+  V <- vcov(fit)
+  needed <- names(weights)
+
+  if (any(!(needed %in% names(b))) ||
+      any(!is.finite(b[needed])) ||
+      any(!is.finite(V[needed, needed, drop = FALSE]))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  # Use only the requested coefficients: other terms may be aliased in
+  # the large simultaneous-interaction sensitivity model.
+  w <- unname(as.numeric(weights))
+  b_sub <- unname(b[needed])
+  V_sub <- V[needed, needed, drop = FALSE]
+  variance <- as.numeric(t(w) %*% V_sub %*% w)
+  if (!is.finite(variance) || variance <= 0) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+  est <- unname(sum(w * b_sub))
+  se <- unname(sqrt(variance))
+  p <- unname(2 * pnorm(abs(est / se), lower.tail = FALSE))
+  c(est = est, se = se, p = p)
+}
+
+hr_ci <- function(stats) {
+  # unname() is required here for the same reason as in single_coef_stats().
+  # Without it, c(HR = exp(est)) can create a name such as "HR.est",
+  # so downstream extraction with x["HR"] returns NA.
+  est <- unname(stats["est"])
+  se <- unname(stats["se"])
+  if (!is.finite(est) || !is.finite(se)) {
+    return(c(HR = NA_real_, lower_95 = NA_real_, upper_95 = NA_real_))
+  }
+  c(HR = unname(exp(est)),
+    lower_95 = unname(exp(est - 1.96 * se)),
+    upper_95 = unname(exp(est + 1.96 * se)))
+}
+
+safe_name <- function(x) {
+  z <- gsub("[^A-Za-z0-9]+", "_", x)
+  gsub("_+$", "", z)
+}
+
+# ----------------------------------------------------------------------------
+# 2. Read and standardize the five cleaned files
+# ----------------------------------------------------------------------------
+raw_list <- list()
+
+for (yr in waves) {
+  input_file <- input_files[as.character(yr)]
+  if (grepl("\\.csv$", input_file, ignore.case = TRUE)) {
+    d <- read.csv(
+      input_file,
+      stringsAsFactors = FALSE,
+      na.strings = c("", "NA"),
+      colClasses = c(individual_id = "character",
+                     household_id = "character",
+                     community_id = "character"),
+      check.names = FALSE
+    )
+  } else {
+    d <- openxlsx::read.xlsx(input_file, sheet = 1,
+                             colNames = TRUE, detectDates = FALSE)
+  }
+  for (id_col in c("individual_id", "household_id", "community_id")) {
+    if (id_col %in% names(d)) d[[id_col]] <- as.character(d[[id_col]])
+  }
+
+  required_now <- c(
+    "individual_id", "household_id", "community_id",
+    "sex", "age", "marriage_status_raw",
+    paste0("death_", yr), paste0("dibao_", yr),
+    "num_children", "coresident_child",
+    "household_income_per_capita", paste0("hukou_", yr)
+  )
+
+  missing_now <- setdiff(required_now, names(d))
+  if (length(missing_now) > 0) {
+    stop("Year ", yr, " is missing required column(s): ",
+         paste(missing_now, collapse = ", "))
+  }
+
+  d$individual_id <- trimws(d$individual_id)
+  d$household_id <- trimws(d$household_id)
+  d$community_id <- trimws(d$community_id)
+
+  if (yr == 2011) {
+    d$individual_id <- standardize_2011_individual_id(d$individual_id)
+    d$household_id <- standardize_2011_household_id(d$household_id)
+  }
+
+  if (anyDuplicated(d$individual_id)) {
+    stop("Duplicated individual_id detected after standardization in year ", yr)
+  }
+
+  raw_list[[as.character(yr)]] <- d
+}
+
+# ----------------------------------------------------------------------------
+# 3. Build standardized person-wave table
+# ----------------------------------------------------------------------------
+person_wave_list <- list()
+
+for (yr in waves) {
+  d <- raw_list[[as.character(yr)]]
+
+  get_or_na <- function(nm) {
+    if (nm %in% names(d)) d[[nm]] else rep(NA, nrow(d))
+  }
+
+  pw <- data.frame(
+    individual_id = d$individual_id,
+    household_id = d$household_id,
+    community_id = d$community_id,
+    wave = yr,
+    sex = safe_numeric(d$sex),
+    age = safe_numeric(d$age),
+    birth_year_used = safe_numeric(get_or_na("birth_year_used")),
+    marriage_status_raw = safe_numeric(d$marriage_status_raw),
+    num_children = safe_numeric(d$num_children),
+    coresident_child_raw = safe_numeric(d$coresident_child),
+    death = safe_numeric(d[[paste0("death_", yr)]]),
+    dibao = safe_numeric(d[[paste0("dibao_", yr)]]),
+    household_income_per_capita = safe_numeric(d$household_income_per_capita),
+    hukou_raw = safe_numeric(d[[paste0("hukou_", yr)]]),
+    death_year = safe_numeric(get_or_na("death_year")),
+    death_month = safe_numeric(get_or_na("death_month")),
+    stringsAsFactors = FALSE
+  )
+
+  if (any(!is.na(pw$sex) & !(pw$sex %in% c(1, 2)))) {
+    stop("Unexpected sex code in year ", yr)
+  }
+  if (any(!is.na(pw$death) & !(pw$death %in% c(0, 1)))) {
+    stop("Unexpected death code in year ", yr)
+  }
+  if (any(!is.na(pw$dibao) & !(pw$dibao %in% c(0, 1)))) {
+    stop("Unexpected Dibao code in year ", yr)
+  }
+  if (any(!is.na(pw$coresident_child_raw) &
+          !(pw$coresident_child_raw %in% c(0, 1)))) {
+    stop("Unexpected coresident_child code in year ", yr)
+  }
+  if (any(!is.na(pw$hukou_raw) & !(pw$hukou_raw %in% c(1, 2)))) {
+    stop("Unexpected hukou_", yr, " code: only 1, 2 or NA are allowed.")
+  }
+
+  person_wave_list[[as.character(yr)]] <- pw
+}
+
+person_wave <- do.call(rbind, person_wave_list)
+person_wave <- person_wave[order(person_wave$individual_id, person_wave$wave), ]
+rownames(person_wave) <- NULL
+
+# Do not silently force household changes.
+hh_per_person <- tapply(
+  person_wave$household_id,
+  person_wave$individual_id,
+  function(z) length(unique(z[!is.na(z)]))
+)
+if (any(hh_per_person > 1)) {
+  stop("At least one individual is linked to more than one household_id. ",
+       "Inspect household linkage before modelling.")
+}
+
+
+# 4. Household-wave Dibao history
+# ----------------------------------------------------------------------------
+check_household_value <- function(df, variable, yr) {
+  ss <- split(df[[variable]], df$household_id)
+  n_unique <- vapply(
+    ss,
+    function(z) length(unique(z[!is.na(z)])),
+    integer(1)
+  )
+  if (any(n_unique > 1)) {
+    stop("Conflicting non-missing ", variable,
+         " values within household-wave in year ", yr)
+  }
+}
+
+hh_wave_list <- list()
+
+for (yr in waves) {
+  d <- person_wave[person_wave$wave == yr, ]
+  check_household_value(d, "dibao", yr)
+  check_household_value(d, "household_income_per_capita", yr)
+
+  hh_split <- split(d, d$household_id)
+  hh_one <- lapply(hh_split, function(g) {
+    data.frame(
+      household_id = g$household_id[1],
+      wave = yr,
+      dibao = one_nonmissing(g$dibao),
+      any_alive_record = any(g$death == 0, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+  hh_wave_list[[as.character(yr)]] <- do.call(rbind, hh_one)
+}
+
+household_wave <- do.call(rbind, hh_wave_list)
+rownames(household_wave) <- NULL
+
+# Any explicit Yes -> Ever.
+# No Yes + at least one explicit No + no ambiguous observed alive wave -> Never.
+# Otherwise -> Unknown.
+hh_split <- split(household_wave, household_wave$household_id)
+
+household_history <- do.call(rbind, lapply(hh_split, function(g) {
+  any_yes <- any(g$dibao == 1, na.rm = TRUE)
+  any_no <- any(g$dibao == 0, na.rm = TRUE)
+  ambiguous_observed <- any(g$any_alive_record & is.na(g$dibao))
+
+  if (any_yes) {
+    group <- "Ever"
+    first_wave <- min(g$wave[g$dibao == 1], na.rm = TRUE)
+  } else if (any_no && !ambiguous_observed) {
+    group <- "Never"
+    first_wave <- NA_real_
+  } else {
+    group <- "Unknown"
+    first_wave <- NA_real_
+  }
+
+  data.frame(
+    household_id = g$household_id[1],
+    dibao_group = group,
+    first_dibao_wave = first_wave,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(household_history) <- NULL
+
+# ----------------------------------------------------------------------------
+# 5. Fixed sex and death time at person level
+# ----------------------------------------------------------------------------
+person_split <- split(person_wave, person_wave$individual_id)
+
+person_meta <- do.call(rbind, lapply(person_split, function(g) {
+  g <- g[order(g$wave), ]
+  g <- g[order(g$wave), , drop = FALSE]
+  sx <- g$sex[!is.na(g$sex)]
+  # First valid Hukou from any wave; deliberately applied to ALL intervals,
+  # including intervals earlier than the first valid Hukou observation.
+  valid_hukou_idx <- which(g$hukou_raw %in% c(1, 2))
+  first_idx <- if (length(valid_hukou_idx) == 0) NA_integer_ else valid_hukou_idx[1]
+  data.frame(
+    individual_id = g$individual_id[1],
+    household_id = g$household_id[1],
+    sex_fixed = if (length(sx) == 0) NA_real_ else sx[1],
+    sex_conflict = length(unique(sx)) > 1,
+    hukou_fixed = if (is.na(first_idx)) NA_real_ else g$hukou_raw[first_idx],
+    hukou_first_wave = if (is.na(first_idx)) NA_real_ else g$wave[first_idx],
+    hukou_conflict = length(unique(g$hukou_raw[valid_hukou_idx])) > 1,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(person_meta) <- NULL
+
+death_count <- vapply(
+  person_split,
+  function(g) sum(g$death == 1, na.rm = TRUE),
+  numeric(1)
+)
+if (any(death_count > 1)) {
+  stop("At least one person has death==1 in more than one wave.")
+}
+
+death_info <- do.call(rbind, lapply(person_split, function(g) {
+  g <- g[order(g$wave), ]
+  dead_rows <- g[g$death == 1, , drop = FALSE]
+  alive_rows <- g[g$death == 0, , drop = FALSE]
+  last_alive_wave <- if (nrow(alive_rows) == 0) NA_real_ else max(alive_rows$wave)
+
+  if (nrow(dead_rows) == 0) {
+    return(data.frame(
+      individual_id = g$individual_id[1],
+      death_confirmed = 0,
+      death_report_wave = NA_real_,
+      death_time = NA_real_,
+      death_time_source = NA_character_,
+      death_time_issue = NA_character_,
+      last_alive_wave = last_alive_wave,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  d <- dead_rows[1, ]
+  report_wave <- d$wave
+  previous_alive <- alive_rows$wave[alive_rows$wave < report_wave]
+  last_alive_before_report <-
+    if (length(previous_alive) == 0) NA_real_ else max(previous_alive)
+
+  raw_time <- NA_real_
+  raw_source <- "missing"
+
+  if (!is.na(d$death_year)) {
+    if (!is.na(d$death_month) && d$death_month >= 1 && d$death_month <= 12) {
+      raw_time <- d$death_year + (d$death_month - 0.5) / 12
+      raw_source <- "reported_year_month"
+    } else {
+      raw_time <- d$death_year
+      raw_source <- "reported_year"
+    }
+  } else if (!is.na(d$birth_year_used) && !is.na(d$age)) {
+    raw_time <- d$birth_year_used + d$age
+    raw_source <- "cleaned_death_age"
+  }
+
+  valid_raw <- !is.na(raw_time) &&
+    raw_time <= report_wave &&
+    (is.na(last_alive_before_report) || raw_time > last_alive_before_report)
+
+  if (valid_raw) {
+    final_time <- raw_time
+    final_source <- raw_source
+    issue <- NA_character_
+  } else {
+    if (is.na(raw_time)) {
+      issue <- "death_time_missing"
+    } else if (raw_time > report_wave) {
+      issue <- "death_time_after_report_wave"
+    } else if (!is.na(last_alive_before_report) &&
+               raw_time <= last_alive_before_report) {
+      issue <- "death_time_not_after_last_alive"
+    } else {
+      issue <- "death_time_invalid"
+    }
+
+    if (!is.na(last_alive_before_report)) {
+      final_time <- (last_alive_before_report + report_wave) / 2
+      final_source <- "fallback_midpoint"
+    } else {
+      final_time <- report_wave
+      final_source <- "fallback_first_dead_wave"
+    }
+  }
+
+  data.frame(
+    individual_id = g$individual_id[1],
+    death_confirmed = 1,
+    death_report_wave = report_wave,
+    death_time = final_time,
+    death_time_source = final_source,
+    death_time_issue = issue,
+    last_alive_wave = last_alive_wave,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(death_info) <- NULL
+
+person_meta <- merge(person_meta, household_history,
+                     by = "household_id", all.x = TRUE, sort = FALSE)
+person_meta <- merge(person_meta, death_info,
+                     by = "individual_id", all.x = TRUE, sort = FALSE)
+
+# ----------------------------------------------------------------------------
+# 6. Construct B1 start-stop intervals
+# ----------------------------------------------------------------------------
+start_data <- person_wave[
+  person_wave$wave %in% start_waves & person_wave$death == 0,
+  , drop = FALSE
+]
+
+start_data <- merge(
+  start_data,
+  person_meta[, c(
+    "individual_id", "household_id",
+    "sex_fixed", "sex_conflict", "hukou_fixed",
+    "hukou_first_wave", "hukou_conflict",
+    "dibao_group", "first_dibao_wave",
+    "death_confirmed", "death_report_wave",
+    "death_time", "death_time_source",
+    "death_time_issue", "last_alive_wave"
+  )],
+  by = c("individual_id", "household_id"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+start_data$next_wave <- unname(next_wave_lookup[as.character(start_data$wave)])
+start_data$observation_end <- ifelse(
+  start_data$death_confirmed == 1,
+  start_data$death_time,
+  start_data$last_alive_wave
+)
+start_data$stop <- pmin(start_data$next_wave,
+                        start_data$observation_end,
+                        na.rm = FALSE)
+
+# Event is explicitly initialized to 0 so NA cannot propagate silently.
+start_data$event <- 0L
+event_idx <-
+  !is.na(start_data$death_confirmed) &
+  start_data$death_confirmed == 1 &
+  !is.na(start_data$death_time) &
+  !is.na(start_data$stop) &
+  start_data$death_time > start_data$wave &
+  start_data$death_time <= start_data$stop
+start_data$event[event_idx] <- 1L
+
+if (anyNA(start_data$event)) {
+  stop("Internal error: event contains NA after construction.")
+}
+
+start_data$marriage_status <- recode_marriage(start_data$marriage_status_raw)
+start_data$living_children <- recode_children(start_data$num_children)
+start_data$coresident_child <- recode_coresidence(start_data$coresident_child_raw)
+start_data$age_group <- recode_age_group(start_data$age)
+start_data$hukou <- factor(
+  ifelse(start_data$hukou_fixed == 1, "Rural",
+         ifelse(start_data$hukou_fixed == 2, "Urban", NA_character_)),
+  levels = c("Rural", "Urban")
+)
+start_data$sex <- factor(
+  ifelse(start_data$sex_fixed == 1, "Male",
+         ifelse(start_data$sex_fixed == 2, "Female", NA)),
+  levels = c("Male", "Female")
+)
+
+# B1 current/start-wave income. Negative values and genuine zero are retained.
+start_data$current_income_pc <- start_data$household_income_per_capita
+
+start_data$eligible_group <- start_data$dibao_group %in% c("Ever", "Never")
+start_data$eligible_age <- !is.na(start_data$age) & start_data$age >= 45
+start_data$eligible_sex <- !is.na(start_data$sex_fixed)
+start_data$eligible_income <- !is.na(start_data$current_income_pc)
+start_data$after_ever_entry <-
+  start_data$dibao_group != "Ever" |
+  (!is.na(start_data$first_dibao_wave) &
+     start_data$wave >= start_data$first_dibao_wave)
+start_data$positive_interval <- !is.na(start_data$stop) &
+  start_data$stop > start_data$wave
+
+analysis_intervals <- start_data[
+  start_data$eligible_group &
+    start_data$eligible_age &
+    start_data$eligible_sex &
+    start_data$eligible_income &
+    start_data$after_ever_entry &
+    start_data$positive_interval,
+  , drop = FALSE
+]
+
+analysis_intervals$start <- analysis_intervals$wave
+analysis_intervals$person_years <-
+  analysis_intervals$stop - analysis_intervals$start
+
+
+# 7. B1 wave-specific common income tertiles
+# ----------------------------------------------------------------------------
+cutoff_list <- list()
+
+for (yr in start_waves) {
+  h <- unique(
+    analysis_intervals[
+      analysis_intervals$start == yr,
+      c("household_id", "current_income_pc")
+    ]
+  )
+  h <- h[!is.na(h$current_income_pc), , drop = FALSE]
+
+  if (nrow(h) == 0) {
+    stop("No eligible households for B1 income cutoff in wave ", yr)
+  }
+
+  q <- quantile(
+    h$current_income_pc,
+    probs = c(1/3, 2/3),
+    na.rm = TRUE,
+    type = 7,
+    names = FALSE
+  )
+
+  cutoff_list[[as.character(yr)]] <- data.frame(
+    start_wave = yr,
+    q1_T1_T2 = q[1],
+    q2_T2_T3 = q[2],
+    unique_households = nrow(h),
+    stringsAsFactors = FALSE
+  )
+}
+
+wave_income_cutoffs <- do.call(rbind, cutoff_list)
+rownames(wave_income_cutoffs) <- NULL
+
+analysis_intervals$income_tertile <- NA_character_
+
+for (yr in start_waves) {
+  q1 <- wave_income_cutoffs$q1_T1_T2[
+    wave_income_cutoffs$start_wave == yr
+  ]
+  q2 <- wave_income_cutoffs$q2_T2_T3[
+    wave_income_cutoffs$start_wave == yr
+  ]
+
+  idx <- analysis_intervals$start == yr
+  inc <- analysis_intervals$current_income_pc[idx]
+
+  analysis_intervals$income_tertile[idx] <- ifelse(
+    inc <= q1, "T1",
+    ifelse(inc <= q2, "T2", "T3")
+  )
+}
+
+if (anyNA(analysis_intervals$income_tertile)) {
+  stop("Internal error: income_tertile contains NA after B1 classification.")
+}
+
+# ----------------------------------------------------------------------------
+# 8. Final common interaction sample
+# ----------------------------------------------------------------------------
+# Match the final B1 Ever and Never main models: remove marriage Unknown from
+# the fitted Cox sample, but do NOT merge it into another marital category.
+marriage_unknown_idx <-
+  !is.na(analysis_intervals$marriage_status) &
+  as.character(analysis_intervals$marriage_status) == "Unknown"
+
+marriage_unknown_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- analysis_intervals[
+    as.character(analysis_intervals$dibao_group) == gr & marriage_unknown_idx,
+    , drop = FALSE
+  ]
+  data.frame(
+    dibao_group = gr,
+    excluded_intervals = nrow(d),
+    excluded_persons = length(unique(d$individual_id)),
+    excluded_deaths = sum(d$event, na.rm = TRUE),
+    excluded_person_years = sum(d$person_years, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}))
+
+model_data <- analysis_intervals[!marriage_unknown_idx, , drop = FALSE]
+
+model_data$dibao_group <- factor(model_data$dibao_group,
+                                 levels = c("Never", "Ever"))
+model_data$sex <- factor(model_data$sex,
+                         levels = c("Male", "Female"))
+model_data$income_tertile <- factor(model_data$income_tertile,
+                                    levels = c("T1", "T2", "T3"))
+model_data$marriage_status <- factor(
+  as.character(model_data$marriage_status),
+  levels = c("Partnered", "Widowed", "Separated-Divorced", "Never married")
+)
+model_data$living_children <- factor(
+  model_data$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+model_data$coresident_child <- factor(
+  model_data$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+model_data$age_group <- factor(
+  model_data$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+# ADL/IADL are time-updated at the START of each B1 risk interval.
+# Hukou above is fixed at the first valid observation across all five waves.
+adl_wide <- openxlsx::read.xlsx(file_adl, sheet = 1,
+                                colNames = TRUE, detectDates = FALSE)
+adl_columns <- paste0("adl_", waves)
+iadl_columns <- paste0("iadl_", waves)
+missing_adl_columns <- setdiff(c("individual_id", adl_columns, iadl_columns),
+                               names(adl_wide))
+if (length(missing_adl_columns) > 0) {
+  stop("ADL/IADL wide file lacks: ", paste(missing_adl_columns, collapse = ", "))
+}
+adl_wide$individual_id <- trimws(as.character(adl_wide$individual_id))
+adl_wide$individual_id <- standardize_2011_individual_id(adl_wide$individual_id)
+if (anyNA(adl_wide$individual_id) || any(adl_wide$individual_id == "") ||
+    anyDuplicated(adl_wide$individual_id)) {
+  stop("ADL/IADL wide file has missing or duplicate individual_id values.")
+}
+for (nm in c(adl_columns, iadl_columns)) {
+  adl_wide[[nm]] <- safe_numeric(adl_wide[[nm]])
+}
+all_adl <- unlist(adl_wide[adl_columns], use.names = FALSE)
+all_iadl <- unlist(adl_wide[iadl_columns], use.names = FALSE)
+if (any(!is.na(all_adl) & (all_adl < 0 | all_adl > 6))) {
+  stop("ADL must be between 0 and 6, or NA.")
+}
+if (any(!is.na(all_iadl) & (all_iadl < 0 | all_iadl > 5))) {
+  stop("IADL must be between 0 and 5, or NA.")
+}
+
+model_data$adl <- NA_real_
+model_data$iadl <- NA_real_
+for (yr in start_waves) {
+  idx <- which(model_data$wave == yr)
+  if (length(idx) == 0) next
+  lookup <- match(model_data$individual_id[idx], adl_wide$individual_id)
+  model_data$adl[idx] <- adl_wide[[paste0("adl_", yr)]][lookup]
+  model_data$iadl[idx] <- adl_wide[[paste0("iadl_", yr)]][lookup]
+}
+
+# Consistent complete-case sample for ALL primary and simultaneous interactions.
+# Do not recalculate the original wave-specific income tertile cutoffs.
+model_data_before_new_filters <- model_data
+new_missing_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data_before_new_filters[
+    as.character(model_data_before_new_filters$dibao_group) == gr, , drop = FALSE
+  ]
+  excluded <- is.na(d$hukou) | is.na(d$adl) | is.na(d$iadl)
+  data.frame(
+    dibao_group = gr,
+    original_persons = length(unique(d$individual_id)),
+    excluded_persons = length(setdiff(unique(d$individual_id),
+                                      unique(d$individual_id[!excluded]))),
+    excluded_intervals = sum(excluded),
+    excluded_deaths = sum(d$event[excluded]),
+    missing_hukou_intervals = sum(is.na(d$hukou)),
+    missing_adl_intervals = sum(is.na(d$adl)),
+    missing_iadl_intervals = sum(is.na(d$iadl)),
+    stringsAsFactors = FALSE
+  )
+}))
+model_data <- model_data[
+  !is.na(model_data$hukou) & !is.na(model_data$adl) & !is.na(model_data$iadl),
+  , drop = FALSE
+]
+if (nrow(model_data) == 0 ||
+    any(vapply(c("Never", "Ever"), function(gr)
+      sum(model_data$event[as.character(model_data$dibao_group) == gr]),
+      numeric(1)) == 0)) {
+  stop("After Hukou/ADL/IADL filtering, a Dibao group has no usable death events.")
+}
+
+required_model_vars <- c(
+  "start", "stop", "event", "individual_id", "dibao_group",
+  "sex", "income_tertile", "marriage_status",
+  "living_children", "coresident_child", "age_group", "hukou", "adl", "iadl"
+)
+complete_model <- complete.cases(model_data[, required_model_vars])
+if (!all(complete_model)) {
+  stop(sum(!complete_model),
+       " interaction-model interval(s) still contain missing required fields.")
+}
+if (any(model_data$stop <= model_data$start)) {
+  stop("Non-positive risk interval detected in final interaction sample.")
+}
+if (sum(model_data$event) == 0) {
+  stop("No deaths found in final interaction sample.")
+}
+
+# ----------------------------------------------------------------------------
+# 9. Compact sample summary and cell counts
+# ----------------------------------------------------------------------------
+sample_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data[as.character(model_data$dibao_group) == gr, , drop = FALSE]
+  data.frame(
+    dibao_group = gr,
+    persons = length(unique(d$individual_id)),
+    households = length(unique(d$household_id)),
+    intervals = nrow(d),
+    deaths = sum(d$event),
+    person_years = sum(d$person_years),
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Event/person counts for each comparison level, used directly in the final
+# interaction result table so sparse cells are visible without extra QA files.
+get_cell_counts <- function(variable, level, group_name) {
+  d <- model_data[
+    as.character(model_data$dibao_group) == group_name &
+      as.character(model_data[[variable]]) == level,
+    , drop = FALSE
+  ]
+  c(records = nrow(d),
+    persons = length(unique(d$individual_id)),
+    events = sum(d$event, na.rm = TRUE))
+}
+
+
+# 10. Interaction definitions: all 8 explanatory variables
+# ----------------------------------------------------------------------------
+# Method B: other covariates (except fixed sex/Hukou) are from interval start.
+# Models contain the same base covariates and separate age x Dibao baseline hazards.
+# Primary: exclude Unknown-category interactions (but retain them as controls).
+# AllLevels: also interact Unknown in living_children and coresident_child.
+base_covariates <- c(
+  "sex", "income_tertile", "marriage_status", "living_children",
+  "coresident_child", "hukou", "adl", "iadl"
+)
+
+primary_specs <- list(
+  sex = list(type = "category", reference = "Male", levels = c("Female")),
+  income_tertile = list(type = "category", reference = "T1", levels = c("T2", "T3")),
+  marriage_status = list(type = "category", reference = "Partnered",
+                         levels = c("Widowed", "Separated-Divorced", "Never married")),
+  living_children = list(type = "category", reference = "0", levels = c("1", "2", "3+")),
+  coresident_child = list(type = "category", reference = "No", levels = c("Yes")),
+  hukou = list(type = "category", reference = "Rural", levels = c("Urban")),
+  adl = list(type = "numeric", reference = "Per 1 point", levels = "Per 1 point"),
+  iadl = list(type = "numeric", reference = "Per 1 point", levels = "Per 1 point")
+)
+
+all_level_specs <- primary_specs
+all_level_specs$living_children$levels <- c("1", "2", "3+", "Unknown")
+all_level_specs$coresident_child$levels <- c("Yes", "Unknown")
+
+# Each block tests H0: all Dibao interactions of this factor equal zero.
+# Example: income_tertile has two interaction coefficients and a 2-df block test.
+add_interaction_columns <- function(data, variable, spec) {
+  interaction_names <- character(0)
+  level_map <- data.frame(level = character(0), main_term = character(0),
+                          interaction_term = character(0), stringsAsFactors = FALSE)
+  for (lev in spec$levels) {
+    nm <- paste0("int_", variable, "_", safe_name(lev))
+    if (spec$type == "numeric") {
+      data[[nm]] <- as.numeric(as.character(data$dibao_group) == "Ever") *
+        as.numeric(data[[variable]])
+      main_term <- variable
+    } else {
+      data[[nm]] <- as.integer(
+        as.character(data$dibao_group) == "Ever" &
+          as.character(data[[variable]]) == lev
+      )
+      main_term <- paste0(variable, lev)
+    }
+    interaction_names <- c(interaction_names, nm)
+    level_map <- rbind(level_map, data.frame(
+      level = lev, main_term = main_term, interaction_term = nm,
+      stringsAsFactors = FALSE
+    ))
+  }
+  list(data = data, names = interaction_names, level_map = level_map)
+}
+
+build_formula <- function(interaction_names) {
+  rhs <- c(base_covariates, interaction_names,
+           "strata(age_group, dibao_group)")
+  as.formula(paste("Surv(start, stop, event) ~", paste(rhs, collapse = " + ")))
+}
+
+get_cell_counts <- function(data, variable, level, group_name, type) {
+  d <- data[as.character(data$dibao_group) == group_name, , drop = FALSE]
+  if (type == "numeric") {
+    d <- d[!is.na(d[[variable]]), , drop = FALSE]
+  } else {
+    d <- d[as.character(d[[variable]]) == level, , drop = FALSE]
+  }
+  c(intervals = nrow(d), persons = length(unique(d$individual_id)),
+    events = sum(d$event))
+}
+
+interaction_rows <- function(fit, data, factor_name, spec, level_map, analysis_name) {
+  rows <- list()
+  for (j in seq_len(nrow(level_map))) {
+    lev <- level_map$level[j]
+    main_term <- level_map$main_term[j]
+    int_term <- level_map$interaction_term[j]
+
+    never_stats <- single_coef_stats(fit, main_term)
+    ever_stats <- linear_combination_stats(
+      fit, setNames(c(1, 1), c(main_term, int_term))
+    )
+    ratio_stats <- single_coef_stats(fit, int_term)
+    never_ci <- hr_ci(never_stats)
+    ever_ci <- hr_ci(ever_stats)
+    ratio_ci <- hr_ci(ratio_stats)
+    n <- get_cell_counts(data, factor_name, lev, "Never", spec$type)
+    e <- get_cell_counts(data, factor_name, lev, "Ever", spec$type)
+
+    rows[[j]] <- data.frame(
+      analysis = analysis_name, factor = factor_name,
+      reference_level = spec$reference, level = lev,
+      Never_intervals = unname(n["intervals"]),
+      Never_persons = unname(n["persons"]),
+      Never_events = unname(n["events"]),
+      Never_HR = unname(never_ci["HR"]),
+      Never_lower_95 = unname(never_ci["lower_95"]),
+      Never_upper_95 = unname(never_ci["upper_95"]),
+      Never_p = unname(never_stats["p"]),
+      Ever_intervals = unname(e["intervals"]),
+      Ever_persons = unname(e["persons"]),
+      Ever_events = unname(e["events"]),
+      Ever_HR = unname(ever_ci["HR"]),
+      Ever_lower_95 = unname(ever_ci["lower_95"]),
+      Ever_upper_95 = unname(ever_ci["upper_95"]),
+      Ever_p = unname(ever_stats["p"]),
+      HR_ratio_Ever_vs_Never = unname(ratio_ci["HR"]),
+      ratio_lower_95 = unname(ratio_ci["lower_95"]),
+      ratio_upper_95 = unname(ratio_ci["upper_95"]),
+      interaction_p = unname(ratio_stats["p"]),
+      sparse_level_flag = n["events"] < 5 || e["events"] < 5,
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, rows)
+}
+
+# Run one factor's interaction while other factors have common (adjustment) HRs.
+run_one_factor_set <- function(data, specs, analysis_name) {
+  blocks <- list()
+  levels <- list()
+  ph_rows <- list()
+  warnings <- character(0)
+  for (target in names(specs)) {
+    spec <- specs[[target]]
+    z <- add_interaction_columns(data, target, spec)
+    form <- build_formula(z$names)
+    f <- tryCatch(fit_cox_with_warnings(form, z$data), error = function(e)
+      list(fit = NULL, warnings = paste("FIT ERROR:", conditionMessage(e))))
+    if (length(f$warnings) > 0) {
+      warnings <- c(warnings, paste0(analysis_name, " / ", target, ": ", f$warnings))
+    }
+    if (is.null(f$fit)) {
+      blocks[[target]] <- data.frame(
+        analysis = analysis_name, factor = target,
+        chisq = NA_real_, df = NA_real_, p_value = NA_real_,
+        PH_global_p = NA_real_, status = "FIT ERROR", stringsAsFactors = FALSE
+      )
+      next
+    }
+    fit <- f$fit
+    block <- wald_block(fit, z$names)
+    ph <- safe_cox_zph(fit)
+    blocks[[target]] <- data.frame(
+      analysis = analysis_name, factor = target, chisq = block$chisq,
+      df = block$df, p_value = block$p_value,
+      PH_global_p = get_global_ph_p(ph), status = block$status,
+      stringsAsFactors = FALSE
+    )
+    levels[[target]] <- interaction_rows(
+      fit, z$data, target, spec, z$level_map, analysis_name)
+    ph_rows[[target]] <- data.frame(
+      analysis = analysis_name, factor = target,
+      PH_global_p = get_global_ph_p(ph), stringsAsFactors = FALSE
+    )
+  }
+  list(block = do.call(rbind, blocks),
+       levels = do.call(rbind, levels),
+       ph = if (length(ph_rows) == 0) data.frame() else do.call(rbind, ph_rows),
+       warnings = unique(warnings[nzchar(warnings)]))
+}
+
+# Fit ALL interactions together: each factor's heterogeneity is conditional on
+# the other factors being allowed to differ across Never/Ever.
+run_full_set <- function(data, specs, analysis_name) {
+  d <- data
+  maps <- list()
+  block_terms <- list()
+  for (target in names(specs)) {
+    z <- add_interaction_columns(d, target, specs[[target]])
+    d <- z$data
+    maps[[target]] <- z$level_map
+    block_terms[[target]] <- z$names
+  }
+  all_terms <- unlist(block_terms, use.names = FALSE)
+  form <- build_formula(all_terms)
+  f <- tryCatch(fit_cox_with_warnings(form, d), error = function(e)
+    list(fit = NULL, warnings = paste("FIT ERROR:", conditionMessage(e))))
+  if (is.null(f$fit)) {
+    block <- data.frame(
+      analysis = analysis_name, factor = names(specs),
+      chisq = NA_real_, df = NA_real_, p_value = NA_real_,
+      PH_global_p = NA_real_, status = "FIT ERROR", stringsAsFactors = FALSE
+    )
+    return(list(block = block,
+                levels = data.frame(status = "FIT ERROR", stringsAsFactors = FALSE),
+                warnings = f$warnings))
+  }
+  fit <- f$fit
+  ph <- safe_cox_zph(fit)
+  blocks <- lapply(names(specs), function(target) {
+    x <- wald_block(fit, block_terms[[target]])
+    data.frame(
+      analysis = analysis_name, factor = target,
+      chisq = x$chisq, df = x$df, p_value = x$p_value,
+      PH_global_p = get_global_ph_p(ph), status = x$status,
+      stringsAsFactors = FALSE
+    )
+  })
+  levels <- lapply(names(specs), function(target) {
+    interaction_rows(fit, d, target, specs[[target]],
+                     maps[[target]], analysis_name)
+  })
+  list(block = do.call(rbind, blocks), levels = do.call(rbind, levels),
+       warnings = f$warnings)
+}
+
+# 11. The four analyses correspond to the structure of Model A interaction.
+# ----------------------------------------------------------------------------
+primary <- run_one_factor_set(model_data, primary_specs, "Primary_Substantive")
+all_levels <- run_one_factor_set(model_data, all_level_specs, "Sensitivity_AllLevels")
+full_primary <- run_full_set(model_data, primary_specs, "Full_Substantive")
+full_all <- run_full_set(model_data, all_level_specs, "Full_AllLevels")
+
+# 12. Summarize sample, risk intervals, sparse categories, and model warnings
+# ----------------------------------------------------------------------------
+sample_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data[as.character(model_data$dibao_group) == gr, , drop = FALSE]
+  data.frame(
+    dibao_group = gr,
+    persons = length(unique(d$individual_id)),
+    households = length(unique(d$household_id)),
+    intervals = nrow(d),
+    deaths = sum(d$event),
+    person_years = sum(d$person_years),
+    hukou_conflict_persons = length(unique(d$individual_id[d$hukou_conflict])),
+    future_first_hukou_intervals = sum(d$hukou_first_wave > d$start, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}))
+
+results_levels <- list(
+  Primary_Substantive = primary$levels,
+  Sensitivity_AllLevels = all_levels$levels,
+  Full_Substantive = full_primary$levels,
+  Full_AllLevels = full_all$levels
+)
+results_blocks <- list(
+  Primary_Substantive = primary$block,
+  Sensitivity_AllLevels = all_levels$block,
+  Full_Substantive = full_primary$block,
+  Full_AllLevels = full_all$block
+)
+# Repeat the global per-factor Wald test on the corresponding level rows.
+# This keeps the original B primary CSV useful for direct interpretation.
+primary_combined <- primary$levels
+if (nrow(primary_combined) > 0) {
+  ix <- match(primary_combined$factor, primary$block$factor)
+  primary_combined$block_chisq <- primary$block$chisq[ix]
+  primary_combined$block_df <- primary$block$df[ix]
+  primary_combined$block_p <- primary$block$p_value[ix]
+  primary_combined$PH_global_p <- primary$block$PH_global_p[ix]
+  primary_combined$block_status <- primary$block$status[ix]
+}
+
+model_warnings <- unique(c(primary$warnings, all_levels$warnings,
+                           full_primary$warnings, full_all$warnings))
+model_warnings <- model_warnings[nzchar(model_warnings)]
+warning_table <- data.frame(
+  message = if (length(model_warnings) == 0) "No Cox fitting warnings" else model_warnings,
+  stringsAsFactors = FALSE
+)
+
+summary_table <- data.frame(
+  item = c("Method", "Income definition", "Hukou definition", "ADL/IADL definition",
+           "Model comparison", "Ever entry rule", "Reference group",
+           "Never persons", "Never deaths", "Never intervals",
+           "Ever persons", "Ever deaths", "Ever intervals",
+           "Full substantive GLOBAL PH p", "Full all-level GLOBAL PH p"),
+  value = as.character(c(
+    "Model B1 pooled start-stop Cox interaction analysis",
+    "Wave-specific income tertiles at interval start (original cutoffs retained)",
+    "First valid across 2011-2020; Rural=1 (reference), Urban=2; fixed in all intervals",
+    "Wave-specific ADL 0-6 / IADL 0-5 at interval start, complete-case sample",
+    "One-factor-at-a-time and full simultaneous interactions, primary plus all-level sensitivity",
+    "Ever enters from first observed Dibao Yes wave onward",
+    "Never Dibao for HR ratio Ever/Never; separate age x Dibao strata",
+    sample_summary$persons[sample_summary$dibao_group == "Never"],
+    sample_summary$deaths[sample_summary$dibao_group == "Never"],
+    sample_summary$intervals[sample_summary$dibao_group == "Never"],
+    sample_summary$persons[sample_summary$dibao_group == "Ever"],
+    sample_summary$deaths[sample_summary$dibao_group == "Ever"],
+    sample_summary$intervals[sample_summary$dibao_group == "Ever"],
+    full_primary$block$PH_global_p[1],
+    full_all$block$PH_global_p[1]
+  )),
+  stringsAsFactors = FALSE
+)
+
+# 13. Write one Excel workbook plus the original primary-results CSV
+# ----------------------------------------------------------------------------
+excel_file <- file.path(OUTPUT_DIR, "B_Dibao_Interaction_results.xlsx")
+csv_file <- file.path(OUTPUT_DIR, "B_Dibao_Interaction_results.csv")
+wb <- openxlsx::createWorkbook()
+add_output <- function(sheet, tab) {
+  openxlsx::addWorksheet(wb, sheet)
+  openxlsx::writeData(wb, sheet, tab)
+}
+add_output("Summary", summary_table)
+add_output("Sample_QA", sample_summary)
+add_output("NewMissing_QA", new_missing_summary)
+add_output("Income_Cutoffs", wave_income_cutoffs)
+add_output("Primary_Block", primary$block)
+add_output("Primary_Levels", primary_combined)
+add_output("AllLevels_Block", all_levels$block)
+add_output("AllLevels_Levels", all_levels$levels)
+add_output("FullPrimary_Block", full_primary$block)
+add_output("FullPrimary_Levels", full_primary$levels)
+add_output("FullAll_Block", full_all$block)
+add_output("FullAll_Levels", full_all$levels)
+add_output("Model_Warnings", warning_table)
+openxlsx::saveWorkbook(wb, excel_file, overwrite = TRUE)
+write.csv(primary_combined, csv_file, row.names = FALSE, na = "")
+
+cat("\nB1 all-variable interaction analysis: completed.\n")
+cat("Output: ", excel_file, "\n", sep = "")
+cat("Primary overall factor-level interaction tests:\n")
+print(primary$block, row.names = FALSE)
+cat("Full simultaneous model interaction tests:\n")
+print(full_primary$block, row.names = FALSE)
+```
+
+
+```{r}
+# Model B: eight-variable interaction analysis with Model A long-term income.
+# Only the SECOND analysis from B_interaction Test(1).rmd is retained.
+# Income = household mean of available 2011/2013/2015/2018/2020 annual per-capita incomes.
+# Fixed T1/T2/T3 cutoffs are the exact Model A cutoffs; NO CPI adjustment.
+# All other B1 start-stop, covariate, Dibao, ADL/IADL and interaction rules are retained.
+
+# 0. Settings and packages
+# ----------------------------------------------------------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "B_Interaction_outputs")
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+options(stringsAsFactors = FALSE)
+
+waves <- c(2011, 2013, 2015, 2018, 2020)
+start_waves <- c(2011, 2013, 2015, 2018)
+next_wave_lookup <- c("2011" = 2013,
+                      "2013" = 2015,
+                      "2015" = 2018,
+                      "2018" = 2020)
+
+# Keep the existing filenames and working directory.
+# Prefer the original CSV inputs; use the same-named XLSX only if CSV is absent.
+input_csv <- file.path(DATA_DIR, paste0("CHARLS_", waves, "_cleaned.csv"))
+input_xlsx <- file.path(DATA_DIR, paste0("CHARLS_", waves, "_cleaned.xlsx"))
+input_files <- setNames(
+  ifelse(file.exists(input_csv), input_csv, input_xlsx),
+  waves
+)
+file_adl <- file.path(DATA_DIR, "CHARLS_2011_2020_wide_ADL_IADL.xlsx")
+
+if (any(!file.exists(input_files))) {
+  stop("Missing cleaned wave file(s) for: ",
+       paste(names(input_files)[!file.exists(input_files)], collapse = ", "),
+       ". Expected CHARLS_YYYY_cleaned.csv or CHARLS_YYYY_cleaned.xlsx.")
+}
+if (!file.exists(file_adl)) {
+  stop("Missing ADL/IADL file: ", file_adl)
+}
+
+
+# 1. Helper functions
+# ----------------------------------------------------------------------------
+safe_numeric <- function(x) suppressWarnings(as.numeric(x))
+
+one_nonmissing <- function(x) {
+  x <- unique(x[!is.na(x)])
+  if (length(x) == 0) return(NA)
+  x[1]
+}
+
+standardize_2011_individual_id <- function(x) {
+  x <- as.character(x)
+  out <- x
+  idx <- !is.na(x) & nchar(x) == 11
+  out[idx] <- paste0(substr(x[idx], 1, 9), "0", substr(x[idx], 10, 11))
+  out
+}
+
+standardize_2011_household_id <- function(x) {
+  x <- as.character(x)
+  out <- x
+  idx <- !is.na(x) & nchar(x) == 9
+  out[idx] <- paste0(x[idx], "0")
+  out
+}
+
+recode_marriage <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[x %in% c(1, 2, 7)] <- "Partnered"
+  out[x == 5] <- "Widowed"
+  out[x %in% c(3, 4)] <- "Separated-Divorced"
+  out[x == 6] <- "Never married"
+  factor(out,
+         levels = c("Partnered", "Widowed", "Separated-Divorced",
+                    "Never married", "Unknown"))
+}
+
+recode_children <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[!is.na(x) & x == 0] <- "0"
+  out[!is.na(x) & x == 1] <- "1"
+  out[!is.na(x) & x == 2] <- "2"
+  out[!is.na(x) & x >= 3] <- "3+"
+  factor(out, levels = c("0", "1", "2", "3+", "Unknown"))
+}
+
+recode_coresidence <- function(x) {
+  out <- rep("Unknown", length(x))
+  out[!is.na(x) & x == 0] <- "No"
+  out[!is.na(x) & x == 1] <- "Yes"
+  factor(out, levels = c("No", "Yes", "Unknown"))
+}
+
+recode_age_group <- function(x) {
+  cut(x,
+      breaks = c(45, 55, 65, 75, 85, 95, Inf),
+      right = FALSE,
+      labels = c("45-54", "55-64", "65-74",
+                 "75-84", "85-94", "95+"))
+}
+
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = unique(warnings_seen))
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(fit, transform = "km", terms = TRUE, global = TRUE),
+    error = function(e) structure(
+      list(message = conditionMessage(e)),
+      class = "cox_zph_error"
+    )
+  )
+}
+
+get_global_ph_p <- function(ph_object) {
+  if (inherits(ph_object, "cox_zph_error")) return(NA_real_)
+  tab <- as.data.frame(ph_object$table)
+  if (!("GLOBAL" %in% rownames(tab))) return(NA_real_)
+  p_col <- if ("p" %in% names(tab)) "p" else names(tab)[ncol(tab)]
+  as.numeric(tab["GLOBAL", p_col])
+}
+
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(chisq = NA_real_, df = 0L, p_value = NA_real_,
+                      status = "No interaction coefficients found"))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    return(data.frame(chisq = NA_real_, df = length(coefficient_names),
+                      p_value = NA_real_,
+                      status = "Non-finite coefficient/variance; inspect sparse cells"))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(chisq = NA_real_, df = 0L, p_value = NA_real_,
+                      status = "Robust covariance block has rank 0"))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = pchisq(W, df = df, lower.tail = FALSE),
+    status = ifelse(df < length(coefficient_names),
+                    "Reduced-rank robust Wald test", "OK")
+  )
+}
+
+single_coef_stats <- function(fit, term) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  if (!(term %in% names(b)) ||
+      !is.finite(b[term]) ||
+      !is.finite(V[term, term])) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  # unname() is essential here. coef(fit)[term] keeps the coefficient
+  # name; without unname(), c(est = est, ...) creates names such as
+  # "est.sexFemale" rather than "est", so downstream stats["est"] returns NA.
+  est <- unname(b[term])
+  se <- unname(sqrt(V[term, term]))
+  p <- unname(2 * pnorm(abs(est / se), lower.tail = FALSE))
+  c(est = est, se = se, p = p)
+}
+
+linear_combination_stats <- function(fit, weights) {
+  b <- coef(fit)
+  V <- vcov(fit)
+  needed <- names(weights)
+
+  if (any(!(needed %in% names(b))) ||
+      any(!is.finite(b[needed])) ||
+      any(!is.finite(V[needed, needed, drop = FALSE]))) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+
+  # Use only the requested coefficients: other terms may be aliased in
+  # the large simultaneous-interaction sensitivity model.
+  w <- unname(as.numeric(weights))
+  b_sub <- unname(b[needed])
+  V_sub <- V[needed, needed, drop = FALSE]
+  variance <- as.numeric(t(w) %*% V_sub %*% w)
+  if (!is.finite(variance) || variance <= 0) {
+    return(c(est = NA_real_, se = NA_real_, p = NA_real_))
+  }
+  est <- unname(sum(w * b_sub))
+  se <- unname(sqrt(variance))
+  p <- unname(2 * pnorm(abs(est / se), lower.tail = FALSE))
+  c(est = est, se = se, p = p)
+}
+
+hr_ci <- function(stats) {
+  # unname() is required here for the same reason as in single_coef_stats().
+  # Without it, c(HR = exp(est)) can create a name such as "HR.est",
+  # so downstream extraction with x["HR"] returns NA.
+  est <- unname(stats["est"])
+  se <- unname(stats["se"])
+  if (!is.finite(est) || !is.finite(se)) {
+    return(c(HR = NA_real_, lower_95 = NA_real_, upper_95 = NA_real_))
+  }
+  c(HR = unname(exp(est)),
+    lower_95 = unname(exp(est - 1.96 * se)),
+    upper_95 = unname(exp(est + 1.96 * se)))
+}
+
+safe_name <- function(x) {
+  z <- gsub("[^A-Za-z0-9]+", "_", x)
+  gsub("_+$", "", z)
+}
+
+# ----------------------------------------------------------------------------
+# 2. Read and standardize the five cleaned files
+# ----------------------------------------------------------------------------
+raw_list <- list()
+
+for (yr in waves) {
+  input_file <- input_files[as.character(yr)]
+  if (grepl("\\.csv$", input_file, ignore.case = TRUE)) {
+    d <- read.csv(
+      input_file,
+      stringsAsFactors = FALSE,
+      na.strings = c("", "NA"),
+      colClasses = c(individual_id = "character",
+                     household_id = "character",
+                     community_id = "character"),
+      check.names = FALSE
+    )
+  } else {
+    d <- openxlsx::read.xlsx(input_file, sheet = 1,
+                             colNames = TRUE, detectDates = FALSE)
+  }
+  for (id_col in c("individual_id", "household_id", "community_id")) {
+    if (id_col %in% names(d)) d[[id_col]] <- as.character(d[[id_col]])
+  }
+
+  required_now <- c(
+    "individual_id", "household_id", "community_id",
+    "sex", "age", "marriage_status_raw",
+    paste0("death_", yr), paste0("dibao_", yr),
+    "num_children", "coresident_child",
+    "household_income_per_capita", paste0("hukou_", yr)
+  )
+
+  missing_now <- setdiff(required_now, names(d))
+  if (length(missing_now) > 0) {
+    stop("Year ", yr, " is missing required column(s): ",
+         paste(missing_now, collapse = ", "))
+  }
+
+  d$individual_id <- trimws(d$individual_id)
+  d$household_id <- trimws(d$household_id)
+  d$community_id <- trimws(d$community_id)
+
+  if (yr == 2011) {
+    d$individual_id <- standardize_2011_individual_id(d$individual_id)
+    d$household_id <- standardize_2011_household_id(d$household_id)
+  }
+
+  if (anyDuplicated(d$individual_id)) {
+    stop("Duplicated individual_id detected after standardization in year ", yr)
+  }
+
+  raw_list[[as.character(yr)]] <- d
+}
+
+# ----------------------------------------------------------------------------
+# 3. Build standardized person-wave table
+# ----------------------------------------------------------------------------
+person_wave_list <- list()
+
+for (yr in waves) {
+  d <- raw_list[[as.character(yr)]]
+
+  get_or_na <- function(nm) {
+    if (nm %in% names(d)) d[[nm]] else rep(NA, nrow(d))
+  }
+
+  pw <- data.frame(
+    individual_id = d$individual_id,
+    household_id = d$household_id,
+    community_id = d$community_id,
+    wave = yr,
+    sex = safe_numeric(d$sex),
+    age = safe_numeric(d$age),
+    birth_year_used = safe_numeric(get_or_na("birth_year_used")),
+    marriage_status_raw = safe_numeric(d$marriage_status_raw),
+    num_children = safe_numeric(d$num_children),
+    coresident_child_raw = safe_numeric(d$coresident_child),
+    death = safe_numeric(d[[paste0("death_", yr)]]),
+    dibao = safe_numeric(d[[paste0("dibao_", yr)]]),
+    household_income_per_capita = safe_numeric(d$household_income_per_capita),
+    hukou_raw = safe_numeric(d[[paste0("hukou_", yr)]]),
+    death_year = safe_numeric(get_or_na("death_year")),
+    death_month = safe_numeric(get_or_na("death_month")),
+    stringsAsFactors = FALSE
+  )
+
+  if (any(!is.na(pw$sex) & !(pw$sex %in% c(1, 2)))) {
+    stop("Unexpected sex code in year ", yr)
+  }
+  if (any(!is.na(pw$death) & !(pw$death %in% c(0, 1)))) {
+    stop("Unexpected death code in year ", yr)
+  }
+  if (any(!is.na(pw$dibao) & !(pw$dibao %in% c(0, 1)))) {
+    stop("Unexpected Dibao code in year ", yr)
+  }
+  if (any(!is.na(pw$coresident_child_raw) &
+          !(pw$coresident_child_raw %in% c(0, 1)))) {
+    stop("Unexpected coresident_child code in year ", yr)
+  }
+  if (any(!is.na(pw$hukou_raw) & !(pw$hukou_raw %in% c(1, 2)))) {
+    stop("Unexpected hukou_", yr, " code: only 1, 2 or NA are allowed.")
+  }
+
+  person_wave_list[[as.character(yr)]] <- pw
+}
+
+person_wave <- do.call(rbind, person_wave_list)
+person_wave <- person_wave[order(person_wave$individual_id, person_wave$wave), ]
+rownames(person_wave) <- NULL
+
+# Do not silently force household changes.
+hh_per_person <- tapply(
+  person_wave$household_id,
+  person_wave$individual_id,
+  function(z) length(unique(z[!is.na(z)]))
+)
+if (any(hh_per_person > 1)) {
+  stop("At least one individual is linked to more than one household_id. ",
+       "Inspect household linkage before modelling.")
+}
+
+
+# 4. Household-wave Dibao history
+# ----------------------------------------------------------------------------
+check_household_value <- function(df, variable, yr) {
+  ss <- split(df[[variable]], df$household_id)
+  n_unique <- vapply(
+    ss,
+    function(z) length(unique(z[!is.na(z)])),
+    integer(1)
+  )
+  if (any(n_unique > 1)) {
+    stop("Conflicting non-missing ", variable,
+         " values within household-wave in year ", yr)
+  }
+}
+
+hh_wave_list <- list()
+
+for (yr in waves) {
+  d <- person_wave[person_wave$wave == yr, ]
+  check_household_value(d, "dibao", yr)
+  check_household_value(d, "household_income_per_capita", yr)
+
+  hh_split <- split(d, d$household_id)
+  hh_one <- lapply(hh_split, function(g) {
+    data.frame(
+      household_id = g$household_id[1],
+      wave = yr,
+      dibao = one_nonmissing(g$dibao),
+      income_wave = as.numeric(one_nonmissing(g$household_income_per_capita)),
+      any_alive_record = any(g$death == 0, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+  hh_wave_list[[as.character(yr)]] <- do.call(rbind, hh_one)
+}
+
+household_wave <- do.call(rbind, hh_wave_list)
+rownames(household_wave) <- NULL
+
+# Model A long-term mean household per-capita income:
+# (1) one observed income per household per wave, already checked above;
+# (2) simple mean of all available waves, ignoring missing waves;
+# (3) fixed per household across all start-stop intervals.
+# Do not replace missing income with 0; genuine zero and negative income remain valid.
+income_history <- split(household_wave$income_wave, household_wave$household_id)
+household_income_A <- data.frame(
+  household_id = names(income_history),
+  long_mean_household_income_pc = vapply(income_history, function(x) {
+    if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+  }, numeric(1)),
+  n_income_waves = vapply(income_history, function(x) {
+    sum(!is.na(x))
+  }, integer(1)),
+  stringsAsFactors = FALSE
+)
+if (anyDuplicated(household_income_A$household_id)) {
+  stop("Duplicate household_id in long-term household income table.")
+}
+
+# Any explicit Yes -> Ever.
+# No Yes + at least one explicit No + no ambiguous observed alive wave -> Never.
+# Otherwise -> Unknown.
+hh_split <- split(household_wave, household_wave$household_id)
+
+household_history <- do.call(rbind, lapply(hh_split, function(g) {
+  any_yes <- any(g$dibao == 1, na.rm = TRUE)
+  any_no <- any(g$dibao == 0, na.rm = TRUE)
+  ambiguous_observed <- any(g$any_alive_record & is.na(g$dibao))
+
+  if (any_yes) {
+    group <- "Ever"
+    first_wave <- min(g$wave[g$dibao == 1], na.rm = TRUE)
+  } else if (any_no && !ambiguous_observed) {
+    group <- "Never"
+    first_wave <- NA_real_
+  } else {
+    group <- "Unknown"
+    first_wave <- NA_real_
+  }
+
+  data.frame(
+    household_id = g$household_id[1],
+    dibao_group = group,
+    first_dibao_wave = first_wave,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(household_history) <- NULL
+
+# ----------------------------------------------------------------------------
+# 5. Fixed sex and death time at person level
+# ----------------------------------------------------------------------------
+person_split <- split(person_wave, person_wave$individual_id)
+
+person_meta <- do.call(rbind, lapply(person_split, function(g) {
+  g <- g[order(g$wave), ]
+  g <- g[order(g$wave), , drop = FALSE]
+  sx <- g$sex[!is.na(g$sex)]
+  # First valid Hukou from any wave; deliberately applied to ALL intervals,
+  # including intervals earlier than the first valid Hukou observation.
+  valid_hukou_idx <- which(g$hukou_raw %in% c(1, 2))
+  first_idx <- if (length(valid_hukou_idx) == 0) NA_integer_ else valid_hukou_idx[1]
+  data.frame(
+    individual_id = g$individual_id[1],
+    household_id = g$household_id[1],
+    sex_fixed = if (length(sx) == 0) NA_real_ else sx[1],
+    sex_conflict = length(unique(sx)) > 1,
+    hukou_fixed = if (is.na(first_idx)) NA_real_ else g$hukou_raw[first_idx],
+    hukou_first_wave = if (is.na(first_idx)) NA_real_ else g$wave[first_idx],
+    hukou_conflict = length(unique(g$hukou_raw[valid_hukou_idx])) > 1,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(person_meta) <- NULL
+
+death_count <- vapply(
+  person_split,
+  function(g) sum(g$death == 1, na.rm = TRUE),
+  numeric(1)
+)
+if (any(death_count > 1)) {
+  stop("At least one person has death==1 in more than one wave.")
+}
+
+death_info <- do.call(rbind, lapply(person_split, function(g) {
+  g <- g[order(g$wave), ]
+  dead_rows <- g[g$death == 1, , drop = FALSE]
+  alive_rows <- g[g$death == 0, , drop = FALSE]
+  last_alive_wave <- if (nrow(alive_rows) == 0) NA_real_ else max(alive_rows$wave)
+
+  if (nrow(dead_rows) == 0) {
+    return(data.frame(
+      individual_id = g$individual_id[1],
+      death_confirmed = 0,
+      death_report_wave = NA_real_,
+      death_time = NA_real_,
+      death_time_source = NA_character_,
+      death_time_issue = NA_character_,
+      last_alive_wave = last_alive_wave,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  d <- dead_rows[1, ]
+  report_wave <- d$wave
+  previous_alive <- alive_rows$wave[alive_rows$wave < report_wave]
+  last_alive_before_report <-
+    if (length(previous_alive) == 0) NA_real_ else max(previous_alive)
+
+  raw_time <- NA_real_
+  raw_source <- "missing"
+
+  if (!is.na(d$death_year)) {
+    if (!is.na(d$death_month) && d$death_month >= 1 && d$death_month <= 12) {
+      raw_time <- d$death_year + (d$death_month - 0.5) / 12
+      raw_source <- "reported_year_month"
+    } else {
+      raw_time <- d$death_year
+      raw_source <- "reported_year"
+    }
+  } else if (!is.na(d$birth_year_used) && !is.na(d$age)) {
+    raw_time <- d$birth_year_used + d$age
+    raw_source <- "cleaned_death_age"
+  }
+
+  valid_raw <- !is.na(raw_time) &&
+    raw_time <= report_wave &&
+    (is.na(last_alive_before_report) || raw_time > last_alive_before_report)
+
+  if (valid_raw) {
+    final_time <- raw_time
+    final_source <- raw_source
+    issue <- NA_character_
+  } else {
+    if (is.na(raw_time)) {
+      issue <- "death_time_missing"
+    } else if (raw_time > report_wave) {
+      issue <- "death_time_after_report_wave"
+    } else if (!is.na(last_alive_before_report) &&
+               raw_time <= last_alive_before_report) {
+      issue <- "death_time_not_after_last_alive"
+    } else {
+      issue <- "death_time_invalid"
+    }
+
+    if (!is.na(last_alive_before_report)) {
+      final_time <- (last_alive_before_report + report_wave) / 2
+      final_source <- "fallback_midpoint"
+    } else {
+      final_time <- report_wave
+      final_source <- "fallback_first_dead_wave"
+    }
+  }
+
+  data.frame(
+    individual_id = g$individual_id[1],
+    death_confirmed = 1,
+    death_report_wave = report_wave,
+    death_time = final_time,
+    death_time_source = final_source,
+    death_time_issue = issue,
+    last_alive_wave = last_alive_wave,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(death_info) <- NULL
+
+person_meta <- merge(person_meta, household_history,
+                     by = "household_id", all.x = TRUE, sort = FALSE)
+person_meta <- merge(person_meta, death_info,
+                     by = "individual_id", all.x = TRUE, sort = FALSE)
+
+# ----------------------------------------------------------------------------
+# 6. Construct B1 start-stop intervals
+# ----------------------------------------------------------------------------
+start_data <- person_wave[
+  person_wave$wave %in% start_waves & person_wave$death == 0,
+  , drop = FALSE
+]
+
+start_data <- merge(
+  start_data,
+  person_meta[, c(
+    "individual_id", "household_id",
+    "sex_fixed", "sex_conflict", "hukou_fixed",
+    "hukou_first_wave", "hukou_conflict",
+    "dibao_group", "first_dibao_wave",
+    "death_confirmed", "death_report_wave",
+    "death_time", "death_time_source",
+    "death_time_issue", "last_alive_wave"
+  )],
+  by = c("individual_id", "household_id"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+start_data$next_wave <- unname(next_wave_lookup[as.character(start_data$wave)])
+start_data$observation_end <- ifelse(
+  start_data$death_confirmed == 1,
+  start_data$death_time,
+  start_data$last_alive_wave
+)
+start_data$stop <- pmin(start_data$next_wave,
+                        start_data$observation_end,
+                        na.rm = FALSE)
+
+# Event is explicitly initialized to 0 so NA cannot propagate silently.
+start_data$event <- 0L
+event_idx <-
+  !is.na(start_data$death_confirmed) &
+  start_data$death_confirmed == 1 &
+  !is.na(start_data$death_time) &
+  !is.na(start_data$stop) &
+  start_data$death_time > start_data$wave &
+  start_data$death_time <= start_data$stop
+start_data$event[event_idx] <- 1L
+
+if (anyNA(start_data$event)) {
+  stop("Internal error: event contains NA after construction.")
+}
+
+start_data$marriage_status <- recode_marriage(start_data$marriage_status_raw)
+start_data$living_children <- recode_children(start_data$num_children)
+start_data$coresident_child <- recode_coresidence(start_data$coresident_child_raw)
+start_data$age_group <- recode_age_group(start_data$age)
+start_data$hukou <- factor(
+  ifelse(start_data$hukou_fixed == 1, "Rural",
+         ifelse(start_data$hukou_fixed == 2, "Urban", NA_character_)),
+  levels = c("Rural", "Urban")
+)
+start_data$sex <- factor(
+  ifelse(start_data$sex_fixed == 1, "Male",
+         ifelse(start_data$sex_fixed == 2, "Female", NA)),
+  levels = c("Male", "Female")
+)
+
+# Model A income definition: use the SAME five-wave household mean in every risk interval.
+# Match by household_id; no new persons/intervals are created by this lookup.
+start_data$long_mean_household_income_pc <-
+  household_income_A$long_mean_household_income_pc[
+    match(start_data$household_id, household_income_A$household_id)
+  ]
+
+start_data$eligible_group <- start_data$dibao_group %in% c("Ever", "Never")
+start_data$eligible_age <- !is.na(start_data$age) & start_data$age >= 45
+start_data$eligible_sex <- !is.na(start_data$sex_fixed)
+start_data$eligible_income <- !is.na(start_data$long_mean_household_income_pc)
+start_data$after_ever_entry <-
+  start_data$dibao_group != "Ever" |
+  (!is.na(start_data$first_dibao_wave) &
+     start_data$wave >= start_data$first_dibao_wave)
+start_data$positive_interval <- !is.na(start_data$stop) &
+  start_data$stop > start_data$wave
+
+analysis_intervals <- start_data[
+  start_data$eligible_group &
+    start_data$eligible_age &
+    start_data$eligible_sex &
+    start_data$eligible_income &
+    start_data$after_ever_entry &
+    start_data$positive_interval,
+  , drop = FALSE
+]
+
+analysis_intervals$start <- analysis_intervals$wave
+analysis_intervals$person_years <-
+  analysis_intervals$stop - analysis_intervals$start
+
+
+# 7. Model A fixed long-term income tertiles
+# ----------------------------------------------------------------------------
+# Exact cutoffs from Model A; printed to two decimal places in the manuscript.
+# T1 <= q1; T2 (q1, q2]; T3 > q2. No wave-specific recalculation.
+q1 <- 3924.44444444444
+q2 <- 11548.3548148148
+if (!is.finite(q1) || !is.finite(q2) || q1 >= q2) {
+  stop("Invalid fixed Model A income cutoffs.")
+}
+
+fixed_income_cutoffs <- data.frame(
+  income_definition = "Mean of available 2011-2020 household-wave per-capita annual income",
+  income_unit = "CNY per person per year",
+  T1_upper_inclusive = q1,
+  T2_upper_inclusive = q2,
+  n_households_with_income = sum(!is.na(household_income_A$long_mean_household_income_pc)),
+  stringsAsFactors = FALSE
+)
+
+analysis_intervals$income_tertile <- as.character(cut(
+  analysis_intervals$long_mean_household_income_pc,
+  breaks = c(-Inf, q1, q2, Inf),
+  labels = c("T1", "T2", "T3"),
+  include.lowest = TRUE,
+  right = TRUE
+))
+if (anyNA(analysis_intervals$income_tertile)) {
+  stop("Missing income tertile after filtering on Model A long-term mean income.")
+}
+# Verify that each household's income group stays fixed across intervals.
+check_income_groups <- split(analysis_intervals$income_tertile,
+                             analysis_intervals$household_id)
+if (any(vapply(check_income_groups, function(z) length(unique(z)) > 1L,
+               logical(1)))) {
+  stop("A household's fixed long-term income tertile varies across intervals.")
+}
+
+# ----------------------------------------------------------------------------
+# 8. Final common interaction sample
+# ----------------------------------------------------------------------------
+# Match the final B1 Ever and Never main models: remove marriage Unknown from
+# the fitted Cox sample, but do NOT merge it into another marital category.
+marriage_unknown_idx <-
+  !is.na(analysis_intervals$marriage_status) &
+  as.character(analysis_intervals$marriage_status) == "Unknown"
+
+marriage_unknown_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- analysis_intervals[
+    as.character(analysis_intervals$dibao_group) == gr & marriage_unknown_idx,
+    , drop = FALSE
+  ]
+  data.frame(
+    dibao_group = gr,
+    excluded_intervals = nrow(d),
+    excluded_persons = length(unique(d$individual_id)),
+    excluded_deaths = sum(d$event, na.rm = TRUE),
+    excluded_person_years = sum(d$person_years, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}))
+
+model_data <- analysis_intervals[!marriage_unknown_idx, , drop = FALSE]
+
+model_data$dibao_group <- factor(model_data$dibao_group,
+                                 levels = c("Never", "Ever"))
+model_data$sex <- factor(model_data$sex,
+                         levels = c("Male", "Female"))
+model_data$income_tertile <- factor(model_data$income_tertile,
+                                    levels = c("T1", "T2", "T3"))
+model_data$marriage_status <- factor(
+  as.character(model_data$marriage_status),
+  levels = c("Partnered", "Widowed", "Separated-Divorced", "Never married")
+)
+model_data$living_children <- factor(
+  model_data$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+model_data$coresident_child <- factor(
+  model_data$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+model_data$age_group <- factor(
+  model_data$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+# ADL/IADL are time-updated at the START of each B1 risk interval.
+# Hukou above is fixed at the first valid observation across all five waves.
+adl_wide <- openxlsx::read.xlsx(file_adl, sheet = 1,
+                                colNames = TRUE, detectDates = FALSE)
+adl_columns <- paste0("adl_", waves)
+iadl_columns <- paste0("iadl_", waves)
+missing_adl_columns <- setdiff(c("individual_id", adl_columns, iadl_columns),
+                               names(adl_wide))
+if (length(missing_adl_columns) > 0) {
+  stop("ADL/IADL wide file lacks: ", paste(missing_adl_columns, collapse = ", "))
+}
+adl_wide$individual_id <- trimws(as.character(adl_wide$individual_id))
+adl_wide$individual_id <- standardize_2011_individual_id(adl_wide$individual_id)
+if (anyNA(adl_wide$individual_id) || any(adl_wide$individual_id == "") ||
+    anyDuplicated(adl_wide$individual_id)) {
+  stop("ADL/IADL wide file has missing or duplicate individual_id values.")
+}
+for (nm in c(adl_columns, iadl_columns)) {
+  adl_wide[[nm]] <- safe_numeric(adl_wide[[nm]])
+}
+all_adl <- unlist(adl_wide[adl_columns], use.names = FALSE)
+all_iadl <- unlist(adl_wide[iadl_columns], use.names = FALSE)
+if (any(!is.na(all_adl) & (all_adl < 0 | all_adl > 6))) {
+  stop("ADL must be between 0 and 6, or NA.")
+}
+if (any(!is.na(all_iadl) & (all_iadl < 0 | all_iadl > 5))) {
+  stop("IADL must be between 0 and 5, or NA.")
+}
+
+model_data$adl <- NA_real_
+model_data$iadl <- NA_real_
+for (yr in start_waves) {
+  idx <- which(model_data$wave == yr)
+  if (length(idx) == 0) next
+  lookup <- match(model_data$individual_id[idx], adl_wide$individual_id)
+  model_data$adl[idx] <- adl_wide[[paste0("adl_", yr)]][lookup]
+  model_data$iadl[idx] <- adl_wide[[paste0("iadl_", yr)]][lookup]
+}
+
+# Consistent complete-case sample for ALL primary and simultaneous interactions.
+# The Model A fixed long-term income cutoffs are not recalculated after exclusions.
+model_data_before_new_filters <- model_data
+new_missing_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data_before_new_filters[
+    as.character(model_data_before_new_filters$dibao_group) == gr, , drop = FALSE
+  ]
+  excluded <- is.na(d$hukou) | is.na(d$adl) | is.na(d$iadl)
+  data.frame(
+    dibao_group = gr,
+    original_persons = length(unique(d$individual_id)),
+    excluded_persons = length(setdiff(unique(d$individual_id),
+                                      unique(d$individual_id[!excluded]))),
+    excluded_intervals = sum(excluded),
+    excluded_deaths = sum(d$event[excluded]),
+    missing_hukou_intervals = sum(is.na(d$hukou)),
+    missing_adl_intervals = sum(is.na(d$adl)),
+    missing_iadl_intervals = sum(is.na(d$iadl)),
+    stringsAsFactors = FALSE
+  )
+}))
+model_data <- model_data[
+  !is.na(model_data$hukou) & !is.na(model_data$adl) & !is.na(model_data$iadl),
+  , drop = FALSE
+]
+if (nrow(model_data) == 0 ||
+    any(vapply(c("Never", "Ever"), function(gr)
+      sum(model_data$event[as.character(model_data$dibao_group) == gr]),
+      numeric(1)) == 0)) {
+  stop("After Hukou/ADL/IADL filtering, a Dibao group has no usable death events.")
+}
+
+required_model_vars <- c(
+  "start", "stop", "event", "individual_id", "dibao_group",
+  "sex", "income_tertile", "marriage_status",
+  "living_children", "coresident_child", "age_group", "hukou", "adl", "iadl"
+)
+complete_model <- complete.cases(model_data[, required_model_vars])
+if (!all(complete_model)) {
+  stop(sum(!complete_model),
+       " interaction-model interval(s) still contain missing required fields.")
+}
+if (any(model_data$stop <= model_data$start)) {
+  stop("Non-positive risk interval detected in final interaction sample.")
+}
+if (sum(model_data$event) == 0) {
+  stop("No deaths found in final interaction sample.")
+}
+
+# ----------------------------------------------------------------------------
+# 9. Compact sample summary and cell counts
+# ----------------------------------------------------------------------------
+sample_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data[as.character(model_data$dibao_group) == gr, , drop = FALSE]
+  data.frame(
+    dibao_group = gr,
+    persons = length(unique(d$individual_id)),
+    households = length(unique(d$household_id)),
+    intervals = nrow(d),
+    deaths = sum(d$event),
+    person_years = sum(d$person_years),
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Event/person counts for each comparison level, used directly in the final
+# interaction result table so sparse cells are visible without extra QA files.
+get_cell_counts <- function(variable, level, group_name) {
+  d <- model_data[
+    as.character(model_data$dibao_group) == group_name &
+      as.character(model_data[[variable]]) == level,
+    , drop = FALSE
+  ]
+  c(records = nrow(d),
+    persons = length(unique(d$individual_id)),
+    events = sum(d$event, na.rm = TRUE))
+}
+
+
+# 10. Interaction definitions: all 8 explanatory variables
+# ----------------------------------------------------------------------------
+# B start-stop intervals with Model A fixed long-term household income.
+# Other time-varying covariates (except fixed sex/Hukou/income) are from interval start.
+# Models contain the same base covariates and separate age x Dibao baseline hazards.
+# Primary: exclude Unknown-category interactions (but retain them as controls).
+# AllLevels: also interact Unknown in living_children and coresident_child.
+base_covariates <- c(
+  "sex", "income_tertile", "marriage_status", "living_children",
+  "coresident_child", "hukou", "adl", "iadl"
+)
+
+primary_specs <- list(
+  sex = list(type = "category", reference = "Male", levels = c("Female")),
+  income_tertile = list(type = "category", reference = "T1", levels = c("T2", "T3")),
+  marriage_status = list(type = "category", reference = "Partnered",
+                         levels = c("Widowed", "Separated-Divorced", "Never married")),
+  living_children = list(type = "category", reference = "0", levels = c("1", "2", "3+")),
+  coresident_child = list(type = "category", reference = "No", levels = c("Yes")),
+  hukou = list(type = "category", reference = "Rural", levels = c("Urban")),
+  adl = list(type = "numeric", reference = "Per 1 point", levels = "Per 1 point"),
+  iadl = list(type = "numeric", reference = "Per 1 point", levels = "Per 1 point")
+)
+
+all_level_specs <- primary_specs
+all_level_specs$living_children$levels <- c("1", "2", "3+", "Unknown")
+all_level_specs$coresident_child$levels <- c("Yes", "Unknown")
+
+# Each block tests H0: all Dibao interactions of this factor equal zero.
+# Example: income_tertile has two interaction coefficients and a 2-df block test.
+add_interaction_columns <- function(data, variable, spec) {
+  interaction_names <- character(0)
+  level_map <- data.frame(level = character(0), main_term = character(0),
+                          interaction_term = character(0), stringsAsFactors = FALSE)
+  for (lev in spec$levels) {
+    nm <- paste0("int_", variable, "_", safe_name(lev))
+    if (spec$type == "numeric") {
+      data[[nm]] <- as.numeric(as.character(data$dibao_group) == "Ever") *
+        as.numeric(data[[variable]])
+      main_term <- variable
+    } else {
+      data[[nm]] <- as.integer(
+        as.character(data$dibao_group) == "Ever" &
+          as.character(data[[variable]]) == lev
+      )
+      main_term <- paste0(variable, lev)
+    }
+    interaction_names <- c(interaction_names, nm)
+    level_map <- rbind(level_map, data.frame(
+      level = lev, main_term = main_term, interaction_term = nm,
+      stringsAsFactors = FALSE
+    ))
+  }
+  list(data = data, names = interaction_names, level_map = level_map)
+}
+
+build_formula <- function(interaction_names) {
+  rhs <- c(base_covariates, interaction_names,
+           "strata(age_group, dibao_group)")
+  as.formula(paste("Surv(start, stop, event) ~", paste(rhs, collapse = " + ")))
+}
+
+get_cell_counts <- function(data, variable, level, group_name, type) {
+  d <- data[as.character(data$dibao_group) == group_name, , drop = FALSE]
+  if (type == "numeric") {
+    d <- d[!is.na(d[[variable]]), , drop = FALSE]
+  } else {
+    d <- d[as.character(d[[variable]]) == level, , drop = FALSE]
+  }
+  c(intervals = nrow(d), persons = length(unique(d$individual_id)),
+    events = sum(d$event))
+}
+
+interaction_rows <- function(fit, data, factor_name, spec, level_map, analysis_name) {
+  rows <- list()
+  for (j in seq_len(nrow(level_map))) {
+    lev <- level_map$level[j]
+    main_term <- level_map$main_term[j]
+    int_term <- level_map$interaction_term[j]
+
+    never_stats <- single_coef_stats(fit, main_term)
+    ever_stats <- linear_combination_stats(
+      fit, setNames(c(1, 1), c(main_term, int_term))
+    )
+    ratio_stats <- single_coef_stats(fit, int_term)
+    never_ci <- hr_ci(never_stats)
+    ever_ci <- hr_ci(ever_stats)
+    ratio_ci <- hr_ci(ratio_stats)
+    n <- get_cell_counts(data, factor_name, lev, "Never", spec$type)
+    e <- get_cell_counts(data, factor_name, lev, "Ever", spec$type)
+
+    rows[[j]] <- data.frame(
+      analysis = analysis_name, factor = factor_name,
+      reference_level = spec$reference, level = lev,
+      Never_intervals = unname(n["intervals"]),
+      Never_persons = unname(n["persons"]),
+      Never_events = unname(n["events"]),
+      Never_HR = unname(never_ci["HR"]),
+      Never_lower_95 = unname(never_ci["lower_95"]),
+      Never_upper_95 = unname(never_ci["upper_95"]),
+      Never_p = unname(never_stats["p"]),
+      Ever_intervals = unname(e["intervals"]),
+      Ever_persons = unname(e["persons"]),
+      Ever_events = unname(e["events"]),
+      Ever_HR = unname(ever_ci["HR"]),
+      Ever_lower_95 = unname(ever_ci["lower_95"]),
+      Ever_upper_95 = unname(ever_ci["upper_95"]),
+      Ever_p = unname(ever_stats["p"]),
+      HR_ratio_Ever_vs_Never = unname(ratio_ci["HR"]),
+      ratio_lower_95 = unname(ratio_ci["lower_95"]),
+      ratio_upper_95 = unname(ratio_ci["upper_95"]),
+      interaction_p = unname(ratio_stats["p"]),
+      sparse_level_flag = n["events"] < 5 || e["events"] < 5,
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, rows)
+}
+
+# Run one factor's interaction while other factors have common (adjustment) HRs.
+run_one_factor_set <- function(data, specs, analysis_name) {
+  blocks <- list()
+  levels <- list()
+  ph_rows <- list()
+  warnings <- character(0)
+  for (target in names(specs)) {
+    spec <- specs[[target]]
+    z <- add_interaction_columns(data, target, spec)
+    form <- build_formula(z$names)
+    f <- tryCatch(fit_cox_with_warnings(form, z$data), error = function(e)
+      list(fit = NULL, warnings = paste("FIT ERROR:", conditionMessage(e))))
+    if (length(f$warnings) > 0) {
+      warnings <- c(warnings, paste0(analysis_name, " / ", target, ": ", f$warnings))
+    }
+    if (is.null(f$fit)) {
+      blocks[[target]] <- data.frame(
+        analysis = analysis_name, factor = target,
+        chisq = NA_real_, df = NA_real_, p_value = NA_real_,
+        PH_global_p = NA_real_, status = "FIT ERROR", stringsAsFactors = FALSE
+      )
+      next
+    }
+    fit <- f$fit
+    block <- wald_block(fit, z$names)
+    ph <- safe_cox_zph(fit)
+    blocks[[target]] <- data.frame(
+      analysis = analysis_name, factor = target, chisq = block$chisq,
+      df = block$df, p_value = block$p_value,
+      PH_global_p = get_global_ph_p(ph), status = block$status,
+      stringsAsFactors = FALSE
+    )
+    levels[[target]] <- interaction_rows(
+      fit, z$data, target, spec, z$level_map, analysis_name)
+    ph_rows[[target]] <- data.frame(
+      analysis = analysis_name, factor = target,
+      PH_global_p = get_global_ph_p(ph), stringsAsFactors = FALSE
+    )
+  }
+  list(block = do.call(rbind, blocks),
+       levels = do.call(rbind, levels),
+       ph = if (length(ph_rows) == 0) data.frame() else do.call(rbind, ph_rows),
+       warnings = unique(warnings[nzchar(warnings)]))
+}
+
+# Fit ALL interactions together: each factor's heterogeneity is conditional on
+# the other factors being allowed to differ across Never/Ever.
+run_full_set <- function(data, specs, analysis_name) {
+  d <- data
+  maps <- list()
+  block_terms <- list()
+  for (target in names(specs)) {
+    z <- add_interaction_columns(d, target, specs[[target]])
+    d <- z$data
+    maps[[target]] <- z$level_map
+    block_terms[[target]] <- z$names
+  }
+  all_terms <- unlist(block_terms, use.names = FALSE)
+  form <- build_formula(all_terms)
+  f <- tryCatch(fit_cox_with_warnings(form, d), error = function(e)
+    list(fit = NULL, warnings = paste("FIT ERROR:", conditionMessage(e))))
+  if (is.null(f$fit)) {
+    block <- data.frame(
+      analysis = analysis_name, factor = names(specs),
+      chisq = NA_real_, df = NA_real_, p_value = NA_real_,
+      PH_global_p = NA_real_, status = "FIT ERROR", stringsAsFactors = FALSE
+    )
+    return(list(block = block,
+                levels = data.frame(status = "FIT ERROR", stringsAsFactors = FALSE),
+                warnings = f$warnings))
+  }
+  fit <- f$fit
+  ph <- safe_cox_zph(fit)
+  blocks <- lapply(names(specs), function(target) {
+    x <- wald_block(fit, block_terms[[target]])
+    data.frame(
+      analysis = analysis_name, factor = target,
+      chisq = x$chisq, df = x$df, p_value = x$p_value,
+      PH_global_p = get_global_ph_p(ph), status = x$status,
+      stringsAsFactors = FALSE
+    )
+  })
+  levels <- lapply(names(specs), function(target) {
+    interaction_rows(fit, d, target, specs[[target]],
+                     maps[[target]], analysis_name)
+  })
+  list(block = do.call(rbind, blocks), levels = do.call(rbind, levels),
+       warnings = f$warnings)
+}
+
+# 11. The four analyses correspond to the structure of Model A interaction.
+# ----------------------------------------------------------------------------
+primary <- run_one_factor_set(model_data, primary_specs, "Primary_Substantive")
+all_levels <- run_one_factor_set(model_data, all_level_specs, "Sensitivity_AllLevels")
+full_primary <- run_full_set(model_data, primary_specs, "Full_Substantive")
+full_all <- run_full_set(model_data, all_level_specs, "Full_AllLevels")
+
+# 12. Summarize sample, risk intervals, sparse categories, and model warnings
+# ----------------------------------------------------------------------------
+sample_summary <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  d <- model_data[as.character(model_data$dibao_group) == gr, , drop = FALSE]
+  data.frame(
+    dibao_group = gr,
+    persons = length(unique(d$individual_id)),
+    households = length(unique(d$household_id)),
+    intervals = nrow(d),
+    deaths = sum(d$event),
+    person_years = sum(d$person_years),
+    hukou_conflict_persons = length(unique(d$individual_id[d$hukou_conflict])),
+    future_first_hukou_intervals = sum(d$hukou_first_wave > d$start, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}))
+
+results_levels <- list(
+  Primary_Substantive = primary$levels,
+  Sensitivity_AllLevels = all_levels$levels,
+  Full_Substantive = full_primary$levels,
+  Full_AllLevels = full_all$levels
+)
+results_blocks <- list(
+  Primary_Substantive = primary$block,
+  Sensitivity_AllLevels = all_levels$block,
+  Full_Substantive = full_primary$block,
+  Full_AllLevels = full_all$block
+)
+# Repeat the global per-factor Wald test on the corresponding level rows.
+# This keeps the original B primary CSV useful for direct interpretation.
+primary_combined <- primary$levels
+if (nrow(primary_combined) > 0) {
+  ix <- match(primary_combined$factor, primary$block$factor)
+  primary_combined$block_chisq <- primary$block$chisq[ix]
+  primary_combined$block_df <- primary$block$df[ix]
+  primary_combined$block_p <- primary$block$p_value[ix]
+  primary_combined$PH_global_p <- primary$block$PH_global_p[ix]
+  primary_combined$block_status <- primary$block$status[ix]
+}
+
+model_warnings <- unique(c(primary$warnings, all_levels$warnings,
+                           full_primary$warnings, full_all$warnings))
+model_warnings <- model_warnings[nzchar(model_warnings)]
+warning_table <- data.frame(
+  message = if (length(model_warnings) == 0) "No Cox fitting warnings" else model_warnings,
+  stringsAsFactors = FALSE
+)
+
+summary_table <- data.frame(
+  item = c("Method", "Income definition", "Hukou definition", "ADL/IADL definition",
+           "Model comparison", "Ever entry rule", "Reference group",
+           "Never persons", "Never deaths", "Never intervals",
+           "Ever persons", "Ever deaths", "Ever intervals",
+           "Full substantive GLOBAL PH p", "Full all-level GLOBAL PH p"),
+  value = as.character(c(
+    "B start-stop Cox interactions with Model A long-term fixed household income",
+    "2011-2020 available-wave mean household income per capita; fixed Model A cutoffs 3924.44444444444 / 11548.3548148148",
+    "First valid across 2011-2020; Rural=1 (reference), Urban=2; fixed in all intervals",
+    "Wave-specific ADL 0-6 / IADL 0-5 at interval start, complete-case sample",
+    "One-factor-at-a-time and full simultaneous interactions, primary plus all-level sensitivity",
+    "Ever enters from first observed Dibao Yes wave onward",
+    "Never Dibao for HR ratio Ever/Never; separate age x Dibao strata",
+    sample_summary$persons[sample_summary$dibao_group == "Never"],
+    sample_summary$deaths[sample_summary$dibao_group == "Never"],
+    sample_summary$intervals[sample_summary$dibao_group == "Never"],
+    sample_summary$persons[sample_summary$dibao_group == "Ever"],
+    sample_summary$deaths[sample_summary$dibao_group == "Ever"],
+    sample_summary$intervals[sample_summary$dibao_group == "Ever"],
+    full_primary$block$PH_global_p[1],
+    full_all$block$PH_global_p[1]
+  )),
+  stringsAsFactors = FALSE
+)
+
+# 13. Write one Excel workbook plus the original primary-results CSV
+# ----------------------------------------------------------------------------
+# Same output folder, distinct result name to avoid overwriting the wave-specific version.
+excel_file <- file.path(OUTPUT_DIR, "B_Dibao_Interaction_results_longterm_income.xlsx")
+csv_file <- file.path(OUTPUT_DIR, "B_Dibao_Interaction_results_longterm_income.csv")
+wb <- openxlsx::createWorkbook()
+add_output <- function(sheet, tab) {
+  openxlsx::addWorksheet(wb, sheet)
+  openxlsx::writeData(wb, sheet, tab)
+}
+add_output("Summary", summary_table)
+add_output("Sample_QA", sample_summary)
+add_output("NewMissing_QA", new_missing_summary)
+add_output("Income_Cutoffs", fixed_income_cutoffs)
+add_output("Primary_Block", primary$block)
+add_output("Primary_Levels", primary_combined)
+add_output("AllLevels_Block", all_levels$block)
+add_output("AllLevels_Levels", all_levels$levels)
+add_output("FullPrimary_Block", full_primary$block)
+add_output("FullPrimary_Levels", full_primary$levels)
+add_output("FullAll_Block", full_all$block)
+add_output("FullAll_Levels", full_all$levels)
+add_output("Model_Warnings", warning_table)
+openxlsx::saveWorkbook(wb, excel_file, overwrite = TRUE)
+write.csv(primary_combined, csv_file, row.names = FALSE, na = "")
+
+cat("\nB all-variable interaction with Model A fixed long-term income: completed.\n")
+cat("Output: ", excel_file, "\n", sep = "")
+cat("Primary overall factor-level interaction tests:\n")
+print(primary$block, row.names = FALSE)
+cat("Full simultaneous model interaction tests:\n")
+print(full_primary$block, row.names = FALSE)
+```
+
+
+
+
+
+
+#Final
+```{r}
+# as the updated Model A and Model B1 Ever/Never analyses.
+#
+# Main analysis: one Dibao interaction at a time for 8 factors; ALL 8
+# factors remain adjusted in EVERY model. Other factors' HRs are common
+# between Dibao groups in each one-factor interaction model.
+# Sensitivity: all 8 factors allowed to interact simultaneously.
+# Unknown missingness categories are controls in substantive models and
+# additionally interacted only in separate all-level sensitivity models.
+# ADL and IADL interact separately in primary analysis, and simultaneously
+# in full interaction models. NO ADL:IADL or three-way interaction is fitted.
+#
+# Data sources (same working directory):
+#   A_Cox_outputs/A_Cox_common_data.rds
+#   CHARLS_2011_2020_wide_ADL_IADL.xlsx
+# Mandatory sample verification against BOTH renamed Model B1 M4 workbooks.
+# No raw CHARLS files are reread, no source data are modified.
+# B1 samples are checked against the renamed Ever/Never Excel result tables.
+# Preparing this script does NOT execute any statistical analysis.
+# ================================================================
+
+# 0. Packages and paths
+# Use the working directory containing the A_Cox_outputs folder,
+# the ADL/IADL wide Excel file, and the TWO renamed B1 result workbooks.
+DATA_DIR <- "."
+A_DIR <- file.path(DATA_DIR, "A_Cox_outputs")
+COMMON_RDS <- file.path(A_DIR, "A_Cox_common_data.rds")
+ADL_FILE <- file.path(DATA_DIR, "CHARLS_2011_2020_wide_ADL_IADL.xlsx")
+B1_EVER_XLSX <- file.path(DATA_DIR, "Model B1_Ever_ADL_IADL_Cox_results.xlsx")
+B1_NEVER_XLSX <- file.path(DATA_DIR, "Model B1_Never_ADL_IADL_Cox_results.xlsx")
+
+# OUTPUT_DIR is a FOLDER, not an Excel filename.
+OUTPUT_DIR <- file.path(DATA_DIR, "B_Interaction_outputs")
+OUTPUT_XLSX <- file.path(OUTPUT_DIR, "Model B2_Dibao_Interaction_results.xlsx")
+OUTPUT_RDS <- file.path(OUTPUT_DIR, "Model B2_Dibao_Interaction_ADL_IADL_results.rds")
+MIN_EVENTS_PER_GROUP_LEVEL <- 5L
+
+needed_packages <- c("survival", "readxl", "openxlsx")
+missing_packages <- needed_packages[
+  !vapply(needed_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install R packages first: ", paste(missing_packages, collapse = ", "))
+}
+library(survival)
+library(readxl)
+library(openxlsx)
+options(stringsAsFactors = FALSE)
+
+# Require ALL current input files. Do not silently fall back to stale names.
+required_files <- c(
+  Model_A_common_RDS = COMMON_RDS,
+  ADL_IADL_wide_Excel = ADL_FILE,
+  Model_B1_Ever_results = B1_EVER_XLSX,
+  Model_B1_Never_results = B1_NEVER_XLSX
+)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files)) {
+  stop("Required input files not found (names must match exactly):\n",
+       paste(names(missing_files), unname(missing_files), sep = ": ",
+             collapse = "\n"))
+}
+if (file.exists(OUTPUT_DIR) && !dir.exists(OUTPUT_DIR)) {
+  stop("Output directory path already exists as a FILE: ", OUTPUT_DIR)
+}
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUTPUT_DIR, "csv"), recursive = TRUE, showWarnings = FALSE)
+
+# 1. Read, verify, and filter the original Method A risk intervals.
+a_common <- readRDS(COMMON_RDS)
+required_parts <- c("analysis_intervals", "income_cutoffs", "person_meta")
+if (!all(required_parts %in% names(a_common))) {
+  stop("Outdated/incomplete Model A RDS; missing: ",
+       paste(setdiff(required_parts, names(a_common)), collapse = ", "))
+}
+if (!all(c("q1", "q2") %in% names(a_common$income_cutoffs))) {
+  stop("Model A RDS has no named income cutoffs q1 and q2.")
+}
+q1 <- as.numeric(a_common$income_cutoffs["q1"])
+q2 <- as.numeric(a_common$income_cutoffs["q2"])
+if (!all(is.finite(c(q1, q2))) || q1 >= q2) {
+  stop("Invalid Model A household income tertile cutoffs.")
+}
+
+base <- a_common$analysis_intervals
+needed_cols <- c(
+  "individual_id", "household_id", "wave", "start", "stop", "event",
+  "dibao_group", "sex", "income_tertile", "marriage_status",
+  "living_children", "coresident_child", "hukou", "hukou_fixed",
+  "hukou_first_wave", "age_group", "long_mean_household_income_pc"
+)
+if (!all(needed_cols %in% names(base))) {
+  stop("Model A common intervals are missing: ",
+       paste(setdiff(needed_cols, names(base)), collapse = ", "))
+}
+base <- base[as.character(base$dibao_group) %in% c("Never", "Ever"), , drop = FALSE]
+if (!nrow(base)) stop("Model A data have no Ever/Never intervals.")
+base$individual_id <- trimws(as.character(base$individual_id))
+base$household_id <- trimws(as.character(base$household_id))
+base$wave <- as.integer(as.character(base$wave))
+if (anyNA(base$individual_id) || any(base$individual_id == "") ||
+    anyNA(base$wave) || any(!base$wave %in% c(2011L, 2013L, 2015L, 2018L))) {
+  stop("Bad respondent ID or start wave in Model A intervals.")
+}
+if (anyNA(base$start) || anyNA(base$stop) ||
+    any(!is.finite(base$start)) || any(!is.finite(base$stop)) ||
+    any(base$stop <= base$start) ||
+    anyNA(base$event) || any(!base$event %in% c(0L, 1L))) {
+  stop("Invalid start/stop/event fields in Model A intervals.")
+}
+if (anyDuplicated(base[, c("individual_id", "start")])) {
+  stop("Duplicate respondent-start risk intervals in Model A common data.")
+}
+
+# Validate fixed HUKOU exactly as in latest A/B1.
+if (any(!is.na(base$hukou_fixed) & !base$hukou_fixed %in% c(1, 2))) {
+  stop("Expected HUKOU raw codes 1=agricultural, 2=non-agricultural.")
+}
+expected_hukou <- ifelse(is.na(base$hukou_fixed), NA_character_,
+                         ifelse(base$hukou_fixed == 1,
+                                "Agricultural", "Non-agricultural"))
+if (!identical(as.character(base$hukou), expected_hukou) ||
+    any(is.na(base$hukou_fixed) != is.na(base$hukou_first_wave))) {
+  stop("Inconsistent fixed HUKOU in common Model A RDS.")
+}
+expected_income <- ifelse(base$long_mean_household_income_pc <= q1, "T1",
+                          ifelse(base$long_mean_household_income_pc <= q2,
+                                 "T2", "T3"))
+if (anyNA(expected_income) ||
+    anyNA(base$income_tertile) ||
+    !identical(as.character(base$income_tertile), as.character(expected_income))) {
+  stop("Income tertiles differ from the saved Model A cutoffs.")
+}
+
+# Exactly follow B1: marriage Unknown excluded first, then HUKOU missing.
+marriage_unknown <- base[is.na(base$marriage_status) |
+                           as.character(base$marriage_status) == "Unknown", , drop = FALSE]
+marriage_kept <- base[!is.na(base$marriage_status) &
+                        as.character(base$marriage_status) != "Unknown", , drop = FALSE]
+hukou_missing <- marriage_kept[is.na(marriage_kept$hukou), , drop = FALSE]
+original <- marriage_kept[!is.na(marriage_kept$hukou), , drop = FALSE]
+if (!nrow(original)) stop("No eligible risk intervals after Model A filters.")
+
+set_factors <- function(d) {
+  d$dibao_group <- factor(as.character(d$dibao_group), levels = c("Never", "Ever"))
+  d$sex <- factor(as.character(d$sex), levels = c("Male", "Female"))
+  d$income_tertile <- factor(as.character(d$income_tertile), levels = c("T1", "T2", "T3"))
+  d$marriage_status <- factor(as.character(d$marriage_status),
+                              levels = c("Partnered", "Widowed", "Separated-Divorced", "Never married"))
+  d$living_children <- factor(as.character(d$living_children),
+                              levels = c("0", "1", "2", "3+", "Unknown"))
+  d$coresident_child <- factor(as.character(d$coresident_child),
+                               levels = c("No", "Yes", "Unknown"))
+  d$hukou <- factor(as.character(d$hukou),
+                    levels = c("Non-agricultural", "Agricultural"))
+  d$age_group <- factor(as.character(d$age_group),
+                        levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+"))
+  d
+}
+original <- set_factors(original)
+adjustment_vars <- c("sex", "income_tertile", "marriage_status", "living_children",
+                     "coresident_child", "hukou", "age_group", "dibao_group")
+if (anyNA(original[, adjustment_vars, drop = FALSE])) {
+  stop("Missing model covariates after matching the latest Model A/B1 rules.")
+}
+if (any(table(original$dibao_group) == 0L) ||
+    any(tapply(original$event, original$dibao_group, sum) < 1L)) {
+  stop("Both Dibao groups require observations and deaths.")
+}
+
+# 2. Link ADL/IADL from EXACTLY the same interval-start wave as Model B1.
+adl_wide <- as.data.frame(readxl::read_excel(ADL_FILE, sheet = 1))
+waves <- c(2011L, 2013L, 2015L, 2018L, 2020L)
+adl_cols <- paste0("adl_", waves)
+iadl_cols <- paste0("iadl_", waves)
+needed_adl_cols <- c("individual_id", adl_cols, iadl_cols)
+if (!all(needed_adl_cols %in% names(adl_wide))) {
+  stop("ADL/IADL wide file is missing: ",
+       paste(setdiff(needed_adl_cols, names(adl_wide)), collapse = ", "))
+}
+adl_wide$individual_id <- trimws(as.character(adl_wide$individual_id))
+if (anyNA(adl_wide$individual_id) || any(adl_wide$individual_id == "") ||
+    anyDuplicated(adl_wide$individual_id)) {
+  stop("ADL/IADL wide file contains missing/duplicate respondent IDs.")
+}
+score_to_numeric <- function(x, col_name, maximum) {
+  txt <- trimws(as.character(x))
+  missing <- is.na(txt) | txt %in% c("", "NA", "NaN", "NULL")
+  num <- suppressWarnings(as.numeric(txt))
+  if (any(!missing & (is.na(num) | !is.finite(num))) ||
+      any(!is.na(num) & (num < 0 | num > maximum))) {
+    stop("Invalid ADL/IADL values in column: ", col_name)
+  }
+  num
+}
+for (nm in adl_cols) adl_wide[[nm]] <- score_to_numeric(adl_wide[[nm]], nm, 6)
+for (nm in iadl_cols) adl_wide[[nm]] <- score_to_numeric(adl_wide[[nm]], nm, 5)
+missing_ids <- setdiff(unique(original$individual_id), adl_wide$individual_id)
+if (length(missing_ids)) {
+  stop(length(missing_ids), " A model respondents absent from ADL/IADL wide file. ",
+       "Use the identical wide file used in both Model B1 runs.")
+}
+adl_long <- do.call(rbind, lapply(waves, function(yr) {
+  data.frame(individual_id = adl_wide$individual_id, wave = yr,
+             adl = adl_wide[[paste0("adl_", yr)]],
+             iadl = adl_wide[[paste0("iadl_", yr)]],
+             stringsAsFactors = FALSE)
+}))
+if (anyDuplicated(adl_long[, c("individual_id", "wave")])) {
+  stop("Duplicate ADL/IADL respondent + wave keys.")
+}
+match_original <- match(paste(original$individual_id, original$wave, sep = "|"),
+                        paste(adl_long$individual_id, adl_long$wave, sep = "|"))
+if (anyNA(match_original)) stop("Missing respondent-wave join keys for ADL/IADL.")
+original$adl <- adl_long$adl[match_original]
+original$iadl <- adl_long$iadl[match_original]
+
+# Same ADL and IADL joint complete-case interval subset as BOTH B1 M4 models.
+dat <- original[!is.na(original$adl) & !is.na(original$iadl), , drop = FALSE]
+if (!nrow(dat) || anyNA(dat[, c(adjustment_vars, "adl", "iadl"), drop = FALSE])) {
+  stop("No valid complete-case sample for B2 interaction models.")
+}
+if (any(table(dat$dibao_group) == 0L) ||
+    anyNA(tapply(dat$event, dat$dibao_group, sum)) ||
+    any(tapply(dat$event, dat$dibao_group, sum) < 1L)) {
+  stop("At least one Dibao group has no observations/deaths in joint ADL/IADL sample.")
+}
+if (anyDuplicated(dat[, c("individual_id", "start")])) {
+  stop("Duplicate respondent-start intervals after complete-case selection.")
+}
+check_overlap <- function(d) {
+  d <- d[order(d$individual_id, d$start, d$stop), , drop = FALSE]
+  if (nrow(d) < 2L) return(FALSE)
+  same <- d$individual_id[-1L] == d$individual_id[-nrow(d)]
+  overlap <- d$start[-1L] < d$stop[-nrow(d)]
+  any(same & overlap)
+}
+if (check_overlap(dat)) stop("Overlapping risk intervals found for respondents.")
+
+# 3. MANDATORY cross-check with SAVED B1 Ever/Never M4 results.
+# The exact renamed result workbooks must exist. Never rerun B1.
+check_b1_file <- function(path, gr) {
+  d <- dat[as.character(dat$dibao_group) == gr, , drop = FALSE]
+  observed <- c(persons = length(unique(d$individual_id)),
+                intervals = nrow(d), deaths = sum(d$event))
+  if (!file.exists(path)) stop("B1 results workbook is missing: ", path)
+  cmp <- openxlsx::read.xlsx(path, sheet = "Model_Comparison")
+  if (!all(c("Model", "Persons", "Intervals", "Deaths") %in% names(cmp))) {
+    stop("B1 workbook missing Model_Comparison fields: ", path)
+  }
+  target <- cmp[as.character(cmp$Model) == "M4_ADL_IADL", , drop = FALSE]
+  if (nrow(target) != 1L) stop("B1 workbook has no single M4_ADL_IADL row: ", path)
+  expected <- c(persons = as.numeric(target$Persons),
+                intervals = as.numeric(target$Intervals),
+                deaths = as.numeric(target$Deaths))
+  if (anyNA(expected) || any(!is.finite(expected)) ||
+      !isTRUE(all(observed == expected))) {
+    stop("B2 sample differs from B1 M4 for ", gr,
+         ". Check common RDS/wide file versions and the renamed B1 results.")
+  }
+  data.frame(group = gr, B1_workbook_found = TRUE,
+             persons_B2 = observed["persons"], intervals_B2 = observed["intervals"],
+             deaths_B2 = observed["deaths"], persons_B1 = expected["persons"],
+             intervals_B1 = expected["intervals"], deaths_B1 = expected["deaths"],
+             status = "PASS", stringsAsFactors = FALSE)
+}
+b1_sample_check <- rbind(check_b1_file(B1_NEVER_XLSX, "Never"),
+                         check_b1_file(B1_EVER_XLSX, "Ever"))
+
+# 4. Sample and event distributions (for interpretation/QA only).
+summarize_group <- function(d, gr) {
+  z <- d[as.character(d$dibao_group) == gr, , drop = FALSE]
+  data.frame(group = gr, persons = length(unique(z$individual_id)),
+             households = length(unique(z$household_id)),
+             intervals = nrow(z), deaths = sum(z$event),
+             person_years = sum(z$stop - z$start), stringsAsFactors = FALSE)
+}
+sample_summary <- rbind(summarize_group(dat, "Never"),
+                        summarize_group(dat, "Ever"))
+
+exclusion_qa <- do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+  all <- base[as.character(base$dibao_group) == gr, , drop = FALSE]
+  marriage_drop <- marriage_unknown[as.character(marriage_unknown$dibao_group) == gr, , drop = FALSE]
+  hukou_drop <- hukou_missing[as.character(hukou_missing$dibao_group) == gr, , drop = FALSE]
+  orig <- original[as.character(original$dibao_group) == gr, , drop = FALSE]
+  common <- dat[as.character(dat$dibao_group) == gr, , drop = FALSE]
+  data.frame(group = gr,
+             intervals_before_model_exclusions = nrow(all),
+             marriage_unknown_intervals = nrow(marriage_drop),
+             hukou_missing_intervals = nrow(hukou_drop),
+             hukou_missing_deaths = sum(hukou_drop$event),
+             B1_original_intervals = nrow(orig),
+             adl_iadl_missing_intervals = nrow(orig) - nrow(common),
+             adl_iadl_missing_deaths = sum(orig$event) - sum(common$event),
+             B1_M4_intervals = nrow(common),
+             B1_M4_deaths = sum(common$event),
+             fixed_hukou_recorded_after_interval_start =
+               sum(common$hukou_first_wave > common$wave, na.rm = TRUE),
+             stringsAsFactors = FALSE)
+}))
+income_qa <- data.frame(cutoff = c("q1", "q2"), value = c(q1, q2),
+                        source = "The existing Model A public RDS; never recomputed")
+
+categorical_levels <- list(
+  sex = c("Female"), income_tertile = c("T2", "T3"),
+  marriage_status = c("Widowed", "Separated-Divorced", "Never married"),
+  living_children = c("1", "2", "3+"), coresident_child = c("Yes"),
+  hukou = c("Agricultural")
+)
+all_levels <- categorical_levels
+all_levels$living_children <- c("1", "2", "3+", "Unknown")
+all_levels$coresident_child <- c("Yes", "Unknown")
+# ADL and IADL are continuous, each HR is PER 1-POINT INCREASE.
+primary_specs <- c(categorical_levels, list(adl = "per 1 point", iadl = "per 1 point"))
+all_level_specs <- c(all_levels, list(adl = "per 1 point", iadl = "per 1 point"))
+
+categorical_qa <- do.call(rbind, lapply(names(categorical_levels), function(var) {
+  do.call(rbind, lapply(levels(dat[[var]]), function(lev) {
+    do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+      z <- dat[as.character(dat$dibao_group) == gr &
+                 as.character(dat[[var]]) == lev, , drop = FALSE]
+      data.frame(group = gr, factor = var, level = lev,
+                 persons = length(unique(z$individual_id)),
+                 intervals = nrow(z), deaths = sum(z$event),
+                 person_years = sum(z$stop-z$start), stringsAsFactors = FALSE)
+    }))
+  }))
+}))
+continuous_qa <- do.call(rbind, lapply(c("adl", "iadl"), function(var) {
+  do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+    z <- dat[as.character(dat$dibao_group) == gr, var]
+    data.frame(group = gr, factor = var, intervals = length(z),
+               min = min(z), median = median(z), mean = mean(z),
+               sd = sd(z), max = max(z),
+               unique_values = length(unique(z)), stringsAsFactors = FALSE)
+  }))
+}))
+
+# For primary categorical interaction levels: >=5 deaths in BOTH groups.
+# For continuous ADL/IADL: at least 5 group deaths and observed variation.
+primary_eligibility <- do.call(rbind, lapply(names(primary_specs), function(var) {
+  if (var %in% c("adl", "iadl")) {
+    out <- lapply(c("Never", "Ever"), function(gr) {
+      d <- dat[as.character(dat$dibao_group) == gr, , drop = FALSE]
+      data.frame(factor = var, level = "per 1 point", group = gr,
+                 deaths = sum(d$event),
+                 eligible = sum(d$event) >= MIN_EVENTS_PER_GROUP_LEVEL &&
+                   length(unique(d[[var]])) >= 2L,
+                 stringsAsFactors = FALSE)
+    })
+  } else {
+    out <- lapply(c("Never", "Ever"), function(gr) {
+      do.call(rbind, lapply(primary_specs[[var]], function(lev) {
+        z <- categorical_qa[categorical_qa$factor == var &
+                              categorical_qa$level == lev &
+                              categorical_qa$group == gr, , drop = FALSE]
+        data.frame(factor = var, level = lev, group = gr,
+                   deaths = z$deaths[1],
+                   eligible = nrow(z) == 1L &&
+                     z$deaths[1] >= MIN_EVENTS_PER_GROUP_LEVEL,
+                   stringsAsFactors = FALSE)
+      }))
+    })
+  }
+  do.call(rbind, out)
+}))
+if (anyNA(primary_eligibility$eligible) || any(!primary_eligibility$eligible)) {
+  bad <- primary_eligibility[is.na(primary_eligibility$eligible) |
+                               !primary_eligibility$eligible, , drop = FALSE]
+  stop("Some primary interaction levels have insufficient events/variation:\n",
+       paste(paste(bad$factor, bad$level, bad$group, bad$deaths), collapse = "\n"))
+}
+
+# 5. Model definitions and statistics.
+base_rhs <- c("sex", "income_tertile", "marriage_status", "living_children",
+              "coresident_child", "hukou", "adl", "iadl")
+safe_name <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+
+add_interactions <- function(d, specs) {
+  all_names <- character()
+  level_map <- data.frame(factor = character(), level = character(),
+                          main_term = character(), int_term = character(),
+                          stringsAsFactors = FALSE)
+  for (var in names(specs)) {
+    for (lev in specs[[var]]) {
+      nm <- paste0("int_", var, "_", safe_name(lev))
+      if (var %in% c("adl", "iadl")) {
+        d[[nm]] <- ifelse(as.character(d$dibao_group) == "Ever", d[[var]], 0)
+        main <- var
+      } else {
+        d[[nm]] <- as.integer(as.character(d$dibao_group) == "Ever" &
+                                as.character(d[[var]]) == lev)
+        main <- paste0(var, lev)
+      }
+      all_names <- c(all_names, nm)
+      level_map <- rbind(level_map,
+                         data.frame(factor = var, level = lev,
+                                    main_term = main, int_term = nm,
+                                    stringsAsFactors = FALSE))
+    }
+  }
+  list(data = d, interaction_names = all_names, map = level_map)
+}
+
+make_formula <- function(int_names) {
+  stats::as.formula(paste("survival::Surv(start, stop, event) ~",
+                          paste(c(base_rhs, int_names,
+                                  "strata(age_group, dibao_group)"),
+                                collapse = " + ")))
+}
+fit_with_warnings <- function(formula, d) {
+  warnings_seen <- character()
+  fit <- withCallingHandlers(
+    survival::coxph(formula, data = d, ties = "efron",
+                    cluster = individual_id, robust = TRUE,
+                    x = TRUE, model = TRUE),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = unique(warnings_seen))
+}
+coef_stats <- function(fit, weights) {
+  b <- coef(fit)
+  vv <- vcov(fit)
+  if (any(!names(weights) %in% names(b))) {
+    return(c(beta = NA_real_, se = NA_real_, p = NA_real_))
+  }
+  sel <- names(weights)
+  if (any(!is.finite(b[sel])) || any(!is.finite(vv[sel, sel, drop = FALSE]))) {
+    return(c(beta = NA_real_, se = NA_real_, p = NA_real_))
+  }
+  est <- sum(b[sel] * weights)
+  v <- as.numeric(t(weights) %*% vv[sel, sel, drop = FALSE] %*% weights)
+  if (!is.finite(v) || v <= 0) return(c(beta = NA_real_, se = NA_real_, p = NA_real_))
+  se <- sqrt(v)
+  c(beta = est, se = se, p = 2 * pnorm(abs(est / se), lower.tail = FALSE))
+}
+hr_from_stats <- function(x) {
+  if (any(!is.finite(x))) {
+    return(c(HR = NA_real_, low = NA_real_, high = NA_real_, p = NA_real_))
+  }
+  c(HR = unname(exp(x["beta"])),
+    low = unname(exp(x["beta"] - qnorm(.975) * x["se"])),
+    high = unname(exp(x["beta"] + qnorm(.975) * x["se"])),
+    p = unname(x["p"]))
+}
+wald_test <- function(fit, terms) {
+  b <- coef(fit)
+  V <- vcov(fit)
+  if (!all(terms %in% names(b))) {
+    return(data.frame(chisq = NA_real_, df = NA_integer_,
+                      p_value = NA_real_, status = "Missing interaction terms"))
+  }
+  bb <- b[terms]
+  vv <- V[terms, terms, drop = FALSE]
+  if (any(!is.finite(bb)) || any(!is.finite(vv))) {
+    return(data.frame(chisq = NA_real_, df = length(terms),
+                      p_value = NA_real_, status = "Nonfinite estimate/covariance"))
+  }
+  eig <- eigen(vv, symmetric = TRUE)
+  tol <- max(abs(eig$values)) * 1e-10
+  good <- eig$values > tol
+  if (!any(good)) {
+    return(data.frame(chisq = NA_real_, df = 0L,
+                      p_value = NA_real_, status = "Zero-rank covariance"))
+  }
+  invert <- eig$vectors[, good, drop = FALSE] %*%
+    diag(1/eig$values[good], nrow = sum(good)) %*%
+    t(eig$vectors[, good, drop = FALSE])
+  stat <- as.numeric(t(bb) %*% invert %*% bb)
+  df <- sum(good)
+  full_rank <- (df == length(terms))
+  data.frame(chisq = stat, df = df,
+             p_value = if (full_rank) pchisq(stat, df, lower.tail = FALSE)
+                       else NA_real_,
+             status = if (full_rank) "OK" else "Reduced rank - no valid full block p")
+}
+ph_diagnostic <- function(fit, formula, d, name) {
+  source <- "clustered robust Cox fit"
+  primary_error <- NA_character_
+  ph <- tryCatch(survival::cox.zph(fit, transform = "km", terms = TRUE,
+                                  global = TRUE), error = function(e) e)
+  if (inherits(ph, "error")) {
+    primary_error <- conditionMessage(ph)
+    source <- "same formula, unclustered PH-only fallback"
+    fallback <- tryCatch(survival::coxph(formula, data = d, ties = "efron",
+                                        x = TRUE, model = TRUE), error = function(e) e)
+    ph <- if (inherits(fallback, "error")) fallback else
+      tryCatch(survival::cox.zph(fallback, transform = "km", terms = TRUE,
+                                global = TRUE), error = function(e) e)
+  }
+  if (inherits(ph, "error")) {
+    return(list(object = NULL,
+                table = data.frame(model = name, term = "PH_TEST_ERROR",
+                                   chisq = NA_real_, df = NA_real_, p = NA_real_,
+                                   diagnostic_source = source,
+                                   message = paste(primary_error, conditionMessage(ph)))))
+  }
+  tb <- as.data.frame(ph$table)
+  list(object = ph,
+       table = data.frame(model = name, term = rownames(tb),
+                          chisq = as.numeric(tb$chisq), df = as.numeric(tb$df),
+                          p = as.numeric(tb$p), diagnostic_source = source,
+                          message = primary_error, stringsAsFactors = FALSE))
+}
+
+reference_labels <- c(sex = "Male", income_tertile = "T1",
+                      marriage_status = "Partnered", living_children = "0",
+                      coresident_child = "No", hukou = "Non-agricultural")
+make_level_rows <- function(fit, map, analysis) {
+  do.call(rbind, lapply(seq_len(nrow(map)), function(i) {
+    mn <- map$main_term[i]
+    it <- map$int_term[i]
+    never <- hr_from_stats(coef_stats(fit, setNames(1, mn)))
+    ever <- hr_from_stats(coef_stats(fit, setNames(c(1, 1), c(mn, it))))
+    ratio <- hr_from_stats(coef_stats(fit, setNames(1, it)))
+    data.frame(analysis = analysis, factor = map$factor[i],
+               comparison = if (map$factor[i] %in% c("adl", "iadl")) {
+                 paste0(toupper(map$factor[i]), " per 1 point")
+               } else {
+                 paste0(map$level[i], " vs ", reference_labels[[map$factor[i]]])
+               },
+               Never_HR = unname(never["HR"]),
+               Never_lower_95 = unname(never["low"]),
+               Never_upper_95 = unname(never["high"]),
+               Never_p = unname(never["p"]),
+               Ever_HR = unname(ever["HR"]),
+               Ever_lower_95 = unname(ever["low"]),
+               Ever_upper_95 = unname(ever["high"]),
+               Ever_p = unname(ever["p"]),
+               HR_ratio_Ever_vs_Never = unname(ratio["HR"]),
+               ratio_lower_95 = unname(ratio["low"]),
+               ratio_upper_95 = unname(ratio["high"]),
+               interaction_p = unname(ratio["p"]), stringsAsFactors = FALSE)
+  }))
+}
+
+# 6. Eight separate interactions: primary inference.
+run_one_by_one <- function(d, specs, analysis) {
+  models <- list()
+  blocks <- list()
+  levels <- list()
+  coefficients <- list()
+  ph_tables <- list()
+  ph_objects <- list()
+  warnings <- list()
+  for (var in names(specs)) {
+    added <- add_interactions(d, setNames(list(specs[[var]]), var))
+    form <- make_formula(added$interaction_names)
+    fit_obj <- fit_with_warnings(form, added$data)
+    fit <- fit_obj$fit
+    models[[var]] <- fit
+    w <- wald_test(fit, added$interaction_names)
+    blocks[[var]] <- data.frame(analysis = analysis, factor = var, w,
+                               n_terms = length(added$interaction_names))
+    levels[[var]] <- make_level_rows(fit, added$map, analysis)
+    coefficients[[var]] <- data.frame(analysis = analysis, factor_tested = var,
+                                       term = names(coef(fit)), beta = as.numeric(coef(fit)),
+                                       stringsAsFactors = FALSE)
+    ph <- ph_diagnostic(fit, form, added$data, paste(analysis, var, sep = "_"))
+    ph_tables[[var]] <- ph$table
+    ph_objects[[var]] <- ph$object
+    if (length(fit_obj$warnings)) {
+      warnings[[var]] <- data.frame(analysis = analysis, model = var,
+                                   warning = fit_obj$warnings)
+    }
+  }
+  list(models = models, blocks = do.call(rbind, blocks),
+       levels = do.call(rbind, levels),
+       coefficients = do.call(rbind, coefficients),
+       ph = do.call(rbind, ph_tables), ph_objects = ph_objects,
+       warnings = if (length(warnings)) do.call(rbind, warnings) else NULL)
+}
+
+# 7. All eight factors interacting simultaneously: sensitivity analyses.
+run_full <- function(d, specs, analysis) {
+  added <- add_interactions(d, specs)
+  form <- make_formula(added$interaction_names)
+  fit_obj <- fit_with_warnings(form, added$data)
+  fit <- fit_obj$fit
+  map <- added$map
+  blocks <- do.call(rbind, lapply(names(specs), function(var) {
+    terms <- map$int_term[map$factor == var]
+    data.frame(analysis = analysis, factor = var, wald_test(fit, terms),
+               n_terms = length(terms))
+  }))
+  levels <- make_level_rows(fit, map, analysis)
+  ph <- ph_diagnostic(fit, form, added$data, analysis)
+  warnings <- if (length(fit_obj$warnings)) {
+    data.frame(analysis = analysis, model = "All eight simultaneous",
+               warning = fit_obj$warnings)
+  } else NULL
+  list(model = fit, blocks = blocks, levels = levels,
+       coefficients = data.frame(analysis = analysis, term = names(coef(fit)),
+                                 beta = as.numeric(coef(fit))),
+       ph = ph$table, ph_object = ph$object, warnings = warnings)
+}
+
+primary <- run_one_by_one(dat, primary_specs, "Primary_Substantive")
+all_level <- run_one_by_one(dat, all_level_specs, "Sensitivity_AllLevels")
+full_sub <- run_full(dat, primary_specs, "Full_Substantive")
+full_all <- run_full(dat, all_level_specs, "Full_AllLevels")
+
+# 8. Gather outputs and diagnostics.
+all_level_eligibility <- do.call(rbind, lapply(names(all_level_specs), function(var) {
+  if (var %in% c("adl", "iadl")) return(NULL)
+  do.call(rbind, lapply(c("Never", "Ever"), function(gr) {
+    do.call(rbind, lapply(all_level_specs[[var]], function(lev) {
+      z <- categorical_qa[categorical_qa$factor == var &
+                            categorical_qa$level == lev &
+                            categorical_qa$group == gr, , drop = FALSE]
+      data.frame(factor = var, level = lev, group = gr,
+                 deaths = if (nrow(z)) z$deaths[1] else NA_integer_,
+                 sparse = !nrow(z) || z$deaths[1] < MIN_EVENTS_PER_GROUP_LEVEL,
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+}))
+
+warnings_all <- Filter(Negate(is.null),
+                       list(primary$warnings, all_level$warnings,
+                            full_sub$warnings, full_all$warnings))
+model_warnings <- if (length(warnings_all)) do.call(rbind, warnings_all) else
+  data.frame(analysis = "None", model = "None",
+             warning = "No Cox fitting warnings captured")
+
+# Holm correction across EIGHT pre-specified PRIMARY block tests.
+# NA remains NA for a non-estimable interaction block.
+primary$blocks$holm_p <- p.adjust(primary$blocks$p_value, method = "holm")
+# A significant individual coefficient does not replace a factor block test.
+
+# 9. Export tables and model objects.
+wb <- openxlsx::createWorkbook()
+add_sheet <- function(name, x) {
+  openxlsx::addWorksheet(wb, name)
+  openxlsx::writeData(wb, name, x)
+  openxlsx::freezePane(wb, name, firstRow = TRUE)
+}
+add_sheet("Sample_Summary", sample_summary)
+add_sheet("Phase1_B1_Check", b1_sample_check)
+add_sheet("Exclusion_QA", exclusion_qa)
+add_sheet("Income_Cutoffs", income_qa)
+add_sheet("Primary_Eligibility", primary_eligibility)
+add_sheet("Primary_Block", primary$blocks)
+add_sheet("Primary_Level_HRs", primary$levels)
+add_sheet("Primary_Coeff", primary$coefficients)
+add_sheet("Primary_PH", primary$ph)
+add_sheet("AllLevel_Block", all_level$blocks)
+add_sheet("AllLevel_Level_HRs", all_level$levels)
+add_sheet("AllLevel_PH", all_level$ph)
+add_sheet("FullSub_Block", full_sub$blocks)
+add_sheet("FullSub_Level_HRs", full_sub$levels)
+add_sheet("FullSub_Coeff", full_sub$coefficients)
+add_sheet("FullSub_PH", full_sub$ph)
+add_sheet("FullAll_Block", full_all$blocks)
+add_sheet("FullAll_Level_HRs", full_all$levels)
+add_sheet("FullAll_Coeff", full_all$coefficients)
+add_sheet("FullAll_PH", full_all$ph)
+add_sheet("Categorical_QA", categorical_qa)
+add_sheet("Continuous_QA", continuous_qa)
+add_sheet("AllLevel_Sparse_QA", all_level_eligibility)
+add_sheet("Model_Warnings", model_warnings)
+openxlsx::saveWorkbook(wb, OUTPUT_XLSX, overwrite = TRUE)
+
+write.csv(primary$blocks,
+          file.path(OUTPUT_DIR, "csv", "B_Interaction_Primary_Block.csv"), row.names = FALSE)
+write.csv(primary$levels,
+          file.path(OUTPUT_DIR, "csv", "B_Interaction_Primary_Level_HRs.csv"), row.names = FALSE)
+write.csv(full_sub$blocks,
+          file.path(OUTPUT_DIR, "csv", "B_Interaction_FullSub_Block.csv"), row.names = FALSE)
+write.csv(full_sub$levels,
+          file.path(OUTPUT_DIR, "csv", "B_Interaction_FullSub_Level_HRs.csv"), row.names = FALSE)
+write.csv(model_warnings,
+          file.path(OUTPUT_DIR, "csv", "B_Interaction_Model_Warnings.csv"), row.names = FALSE)
+
+saveRDS(list(
+  method = "Model B, Phase 2, A-aligned B1 M4 sample",
+  income_cutoffs = c(q1 = q1, q2 = q2),
+  sample_summary = sample_summary, phase1_b1_check = b1_sample_check,
+  exclusion_qa = exclusion_qa, primary_eligibility = primary_eligibility,
+  model_data = dat,
+  primary = primary, all_level = all_level,
+  full_substantive = full_sub, full_all_levels = full_all,
+  warnings = model_warnings
+), OUTPUT_RDS)
+
+capture.output(sessionInfo(),
+               file = file.path(OUTPUT_DIR, "B_Interaction_sessionInfo.txt"))
+
+# PH plots for primary interactions and the full substantive model.
+for (var in names(primary$ph_objects)) {
+  ph <- primary$ph_objects[[var]]
+  if (!is.null(ph)) {
+    grDevices::pdf(file.path(OUTPUT_DIR, paste0("B_Interaction_PH_", var, ".pdf")))
+    try(plot(ph), silent = TRUE)
+    grDevices::dev.off()
+  }
+}
+if (!is.null(full_sub$ph_object)) {
+  grDevices::pdf(file.path(OUTPUT_DIR, "B_Interaction_PH_FullSub.pdf"))
+  try(plot(full_sub$ph_object), silent = TRUE)
+  grDevices::dev.off()
+}
+
+cat("\nMODEL B PHASE 2 | EIGHT-FACTOR EVER-vs-NEVER INTERACTION\n")
+cat("All eight covariates are adjusted in every Cox model.\n")
+cat("Primary: one interaction at a time. FullSub: all eight simultaneously.\n")
+cat("HUKOU: agricultural vs non-agricultural (reference).\n")
+cat("ADL/IADL: separate per-point interactions in primary; both interact in FullSub.\n")
+cat("Rows/deaths must match the respective B1 M4 samples.\n\n")
+print(sample_summary, row.names = FALSE)
+print(b1_sample_check, row.names = FALSE)
+cat("\nPRIMARY INTERACTION BLOCK TESTS (Holm-adjusted p also shown):\n")
+print(primary$blocks, row.names = FALSE)
+cat("\nPRIMARY INTERACTION HR RATIOS:\n")
+print(primary$levels[, c("factor", "comparison", "Never_HR", "Ever_HR",
+                         "HR_ratio_Ever_vs_Never", "ratio_lower_95",
+                         "ratio_upper_95", "interaction_p")], row.names = FALSE)
+cat("\nSIMULTANEOUS EIGHT-FACTOR INTERACTION BLOCK TESTS:\n")
+print(full_sub$blocks, row.names = FALSE)
+cat("\nGLOBAL PH diagnostics (FullSub):\n")
+print(full_sub$ph[full_sub$ph$term %in% c("GLOBAL", "PH_TEST_ERROR"), , drop = FALSE],
+      row.names = FALSE)
+cat("\nSaved: ", OUTPUT_XLSX, "\n", sep = "")
+cat("Saved: ", OUTPUT_RDS, "\n", sep = "")
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+

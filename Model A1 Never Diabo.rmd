@@ -1,0 +1,3288 @@
+---
+title: "A_never Dibao"
+author: "Haoran Hao"
+date: "2026-09-15"
+output: html_document
+---
+
+```{r}
+# 0. Settings
+# ---------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "A_Cox_outputs")
+COMMON_RDS <- file.path(OUTPUT_DIR, "A_Cox_common_data.rds")
+
+# Diagnostic rule for the auxiliary Sex x Marriage analysis.
+# This is a prespecified stability screen for the interaction model, not a
+# substantive population threshold.
+MIN_EVENTS_PER_SEX_MARRIAGE_CELL <- 5L
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "csv"), showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+
+options(stringsAsFactors = FALSE)
+
+if (!file.exists(COMMON_RDS)) {
+  stop(
+    "A_Cox_common_data.rds was not found at: ", COMMON_RDS, "\n",
+    "Run A_Ever_Dibao_Cox_revised.R first. The Never model must use the ",
+    "same common sample and income cutoffs as the Ever model."
+  )
+}
+```
+
+
+```{r}
+# 1. Helper functions
+# ---------------------------
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  list(
+    fit = fit,
+    warnings = unique(warnings_seen)
+  )
+}
+
+extract_cox_results <- function(fit) {
+  s <- summary(fit)
+  coef_table <- as.data.frame(s$coefficients)
+  ci_table <- as.data.frame(s$conf.int)
+
+  out <- data.frame(
+    term = rownames(coef_table),
+    beta = coef_table[, "coef"],
+    HR = ci_table[, "exp(coef)"],
+    lower_95 = ci_table[, "lower .95"],
+    upper_95 = ci_table[, "upper .95"],
+    p_value = coef_table[, "Pr(>|z|)"],
+    row.names = NULL,
+    check.names = FALSE
+  )
+
+  if ("robust se" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "robust se"]
+  } else if ("se(coef)" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "se(coef)"]
+  } else {
+    out$robust_se <- NA_real_
+  }
+
+  out[, c(
+    "term", "beta", "robust_se", "HR",
+    "lower_95", "upper_95", "p_value"
+  )]
+}
+
+make_readable_main_results <- function(x) {
+  label_map <- c(
+    "sexFemale" = "Female vs Male",
+    "income_tertileT2" = "Income T2 vs T1",
+    "income_tertileT3" = "Income T3 vs T1",
+    "marriage_statusWidowed" = "Widowed vs Partnered",
+    "marriage_statusSeparated-Divorced" = "Separated/Divorced vs Partnered",
+    "marriage_statusNever married" = "Never married vs Partnered",
+    "living_children1" = "1 living child vs 0",
+    "living_children2" = "2 living children vs 0",
+    "living_children3+" = "3+ living children vs 0",
+    "living_childrenUnknown" = "Living children Unknown vs 0",
+    "coresident_childYes" = "Coresident child Yes vs No",
+    "coresident_childUnknown" = "Coresident child Unknown vs No"
+  )
+
+  out <- x
+
+  out$comparison <- ifelse(
+    out$term %in% names(label_map),
+    unname(label_map[out$term]),
+    out$term
+  )
+
+  out$HR_95CI <- sprintf(
+    "%.3f (%.3f-%.3f)",
+    out$HR, out$lower_95, out$upper_95
+  )
+
+  out$p_display <- ifelse(
+    is.na(out$p_value),
+    NA_character_,
+    ifelse(out$p_value < 0.001, "<0.001", sprintf("%.3f", out$p_value))
+  )
+
+  out[, c(
+    "comparison", "HR_95CI", "p_display",
+    "beta", "robust_se", "HR", "lower_95", "upper_95", "p_value"
+  )]
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(
+      fit,
+      transform = "km",
+      terms = TRUE,
+      global = TRUE
+    ),
+    error = function(e) {
+      structure(
+        list(message = conditionMessage(e)),
+        class = "cox_zph_error"
+      )
+    }
+  )
+}
+
+ph_table <- function(ph_object) {
+  if (inherits(ph_object, "cox_zph_error")) {
+    return(data.frame(
+      term = "PH_TEST_ERROR",
+      chisq = NA_real_,
+      df = NA_real_,
+      p = NA_real_,
+      message = ph_object$message,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  x <- as.data.frame(ph_object$table)
+  x$term <- rownames(x)
+  rownames(x) <- NULL
+
+  x[, c("term", setdiff(names(x), "term")), drop = FALSE]
+}
+
+# First try cox.zph() on the formal clustered robust Cox fit.
+# If that covariance is computationally singular, fit the EXACT SAME Cox
+# formula without cluster/robust ONLY as a PH diagnostic fallback.
+# The fallback does NOT replace the main HR model.
+run_ph_diagnostic <- function(formula, data, clustered_fit) {
+  primary <- safe_cox_zph(clustered_fit)
+
+  if (!inherits(primary, "cox_zph_error")) {
+    tab <- ph_table(primary)
+    tab$diagnostic_source <- "clustered robust Cox fit"
+    tab$primary_error <- NA_character_
+
+    return(list(
+      object = primary,
+      table = tab,
+      source = "clustered robust Cox fit",
+      primary_error = NA_character_
+    ))
+  }
+
+  diagnostic_fit <- coxph(
+    formula,
+    data = data,
+    ties = "efron",
+    x = TRUE,
+    model = TRUE
+  )
+
+  fallback <- safe_cox_zph(diagnostic_fit)
+  tab <- ph_table(fallback)
+  tab$diagnostic_source <- "same formula, unclustered diagnostic fallback"
+  tab$primary_error <- primary$message
+
+  list(
+    object = fallback,
+    table = tab,
+    source = "same formula, unclustered diagnostic fallback",
+    primary_error = primary$message
+  )
+}
+
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_
+    ))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  ok <- is.finite(b)
+  if (!all(ok)) {
+    b <- b[ok]
+    V <- V[ok, ok, drop = FALSE]
+  }
+
+  if (length(b) == 0 || any(!is.finite(V))) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_
+    ))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_
+    ))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+  p <- pchisq(W, df = df, lower.tail = FALSE)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = p
+  )
+}
+
+linear_combination_hr <- function(fit, weights, label) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  missing_terms <- setdiff(names(weights), names(b))
+
+  if (
+    length(missing_terms) > 0 ||
+      any(!is.finite(b[names(weights)])) ||
+      any(!is.finite(V[names(weights), names(weights), drop = FALSE]))
+  ) {
+    return(data.frame(
+      label = label,
+      log_HR = NA_real_,
+      SE = NA_real_,
+      HR = NA_real_,
+      lower_95 = NA_real_,
+      upper_95 = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  w <- rep(0, length(b))
+  names(w) <- names(b)
+  w[names(weights)] <- weights
+
+  est <- sum(w * b)
+  se <- sqrt(as.numeric(t(w) %*% V %*% w))
+  z <- est / se
+
+  data.frame(
+    label = label,
+    log_HR = est,
+    SE = se,
+    HR = exp(est),
+    lower_95 = exp(est - 1.96 * se),
+    upper_95 = exp(est + 1.96 * se),
+    p_value = 2 * pnorm(abs(z), lower.tail = FALSE)
+  )
+}
+
+make_cell_qa <- function(data, variable) {
+  levs <- levels(data[[variable]])
+
+  if (is.null(levs)) {
+    levs <- sort(unique(as.character(data[[variable]])))
+  }
+
+  out <- lapply(levs, function(z) {
+    d <- data[
+      as.character(data[[variable]]) == z,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      variable = variable,
+      level = z,
+      records = nrow(d),
+      persons = length(unique(d$individual_id)),
+      events = sum(d$event, na.rm = TRUE),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+make_sex_marriage_cell_qa <- function(data) {
+  sexes <- levels(data$sex)
+  marriages <- levels(data$marriage_status)
+
+  grid <- expand.grid(
+    sex = sexes,
+    marriage_status = marriages,
+    stringsAsFactors = FALSE
+  )
+
+  out <- lapply(seq_len(nrow(grid)), function(i) {
+    sx <- grid$sex[i]
+    ms <- grid$marriage_status[i]
+
+    d <- data[
+      as.character(data$sex) == sx &
+        as.character(data$marriage_status) == ms,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      sex = sx,
+      marriage_status = ms,
+      records = nrow(d),
+      persons = length(unique(d$individual_id)),
+      events = sum(d$event, na.rm = TRUE),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+print_table_section <- function(title, x, digits = 4) {
+  cat("\n", paste(rep("=", 72), collapse = ""), "\n", sep = "")
+  cat(title, "\n")
+  cat(paste(rep("=", 72), collapse = ""), "\n", sep = "")
+
+  if (is.null(x)) {
+    cat("No result available.\n")
+  } else {
+    print(x, row.names = FALSE, digits = digits)
+  }
+}
+
+add_sheet <- function(wb, name, x) {
+  addWorksheet(wb, name)
+  writeData(wb, name, x)
+}
+
+# Checks that one person's start-stop intervals do not overlap.
+check_nonoverlap <- function(data) {
+  ids <- unique(data$individual_id)
+  bad <- character(0)
+
+  for (id in ids) {
+    d <- data[data$individual_id == id, , drop = FALSE]
+    d <- d[order(d$start, d$stop), , drop = FALSE]
+
+    if (nrow(d) > 1) {
+      overlap <- d$start[-1] < d$stop[-nrow(d)]
+      if (any(overlap, na.rm = TRUE)) {
+        bad <- c(bad, id)
+      }
+    }
+  }
+
+  unique(bad)
+}
+
+# ---------------------------
+# 2. Read and validate the common Method A object
+# ---------------------------
+common <- readRDS(COMMON_RDS)
+
+required_common_objects <- c(
+  "analysis_intervals",
+  "income_cutoffs",
+  "sample_flow",
+  "group_summary"
+)
+
+missing_common_objects <- setdiff(
+  required_common_objects,
+  names(common)
+)
+
+if (length(missing_common_objects) > 0) {
+  stop(
+    "The common RDS is missing required object(s): ",
+    paste(missing_common_objects, collapse = ", ")
+  )
+}
+
+analysis_intervals <- common$analysis_intervals
+
+required_columns <- c(
+  "individual_id",
+  "household_id",
+  "dibao_group",
+  "start",
+  "stop",
+  "event",
+  "person_years",
+  "sex",
+  "income_tertile",
+  "long_mean_household_income_pc",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "age_group"
+)
+
+missing_columns <- setdiff(
+  required_columns,
+  names(analysis_intervals)
+)
+
+if (length(missing_columns) > 0) {
+  stop(
+    "analysis_intervals is missing required column(s): ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+if (length(common$income_cutoffs) != 2 ||
+    any(!is.finite(common$income_cutoffs))) {
+  stop("The common RDS does not contain two valid finite income cutoffs.")
+}
+
+q1 <- as.numeric(common$income_cutoffs[1])
+q2 <- as.numeric(common$income_cutoffs[2])
+
+if (!(q1 < q2)) {
+  stop("Income cutoffs are invalid: q1 must be smaller than q2.")
+}
+
+# ---------------------------
+# 3. Select Never Dibao records
+# ---------------------------
+never_data_all <- analysis_intervals[
+  as.character(analysis_intervals$dibao_group) == "Never",
+  , drop = FALSE
+]
+
+if (nrow(never_data_all) == 0) {
+  stop("No Never Dibao person-period records were found in the common RDS.")
+}
+
+# Basic integrity checks before modeling.
+if (any(is.na(never_data_all$start)) ||
+    any(is.na(never_data_all$stop))) {
+  stop("Never data contain missing start or stop times.")
+}
+
+if (any(never_data_all$stop <= never_data_all$start)) {
+  stop("Never data contain stop <= start intervals.")
+}
+
+if (any(!never_data_all$event %in% c(0, 1))) {
+  stop("Never data contain event values other than 0/1.")
+}
+
+events_per_person <- tapply(
+  never_data_all$event,
+  never_data_all$individual_id,
+  sum,
+  na.rm = TRUE
+)
+
+if (any(events_per_person > 1)) {
+  stop("At least one Never participant has more than one death event.")
+}
+
+bad_overlap <- check_nonoverlap(never_data_all)
+if (length(bad_overlap) > 0) {
+  stop(
+    "Overlapping person-period intervals detected for ",
+    length(bad_overlap),
+    " Never participant(s). First IDs: ",
+    paste(head(bad_overlap, 10), collapse = ", ")
+  )
+}
+```
+
+
+```{r}
+# 4. Marriage Unknown handling for the formal Never Cox model
+# ---------------------------
+# In the current common sample, marriage Unknown is a very sparse category
+# and has no death events in Never. It is retained in the common object and QA,
+# but excluded from the Cox model intervals rather than estimating an unstable
+# zero-event coefficient.
+marriage_unknown_excluded <- never_data_all[
+  as.character(never_data_all$marriage_status) == "Unknown",
+  , drop = FALSE
+]
+
+never_data <- never_data_all[
+  as.character(never_data_all$marriage_status) != "Unknown",
+  , drop = FALSE
+]
+
+never_data <- droplevels(never_data)
+
+# Re-assert reference categories and factor order.
+never_data$sex <- factor(
+  never_data$sex,
+  levels = c("Male", "Female")
+)
+
+never_data$income_tertile <- factor(
+  never_data$income_tertile,
+  levels = c("T1", "T2", "T3")
+)
+
+never_data$marriage_status <- factor(
+  never_data$marriage_status,
+  levels = c(
+    "Partnered",
+    "Widowed",
+    "Separated-Divorced",
+    "Never married"
+  )
+)
+
+never_data$living_children <- factor(
+  never_data$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+
+never_data$coresident_child <- factor(
+  never_data$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+
+never_data$age_group <- factor(
+  never_data$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+if (any(is.na(never_data$sex))) {
+  stop("Missing sex found in final Never Cox model data.")
+}
+
+if (any(is.na(never_data$income_tertile))) {
+  stop("Missing income tertile found in final Never Cox model data.")
+}
+
+if (any(is.na(never_data$marriage_status))) {
+  stop("Unexpected marriage-status code found after Never recoding/filtering.")
+}
+
+if (any(is.na(never_data$age_group))) {
+  stop("Missing age group found in final Never Cox model data.")
+}
+
+if (sum(never_data$event, na.rm = TRUE) == 0) {
+  stop("No death events remain in the Never Cox model data.")
+}
+
+marriage_unknown_exclusion_summary <- data.frame(
+  rule = "Marriage status Unknown excluded from Cox model intervals",
+  records_excluded = nrow(marriage_unknown_excluded),
+  persons_affected = length(unique(marriage_unknown_excluded$individual_id)),
+  events_excluded = sum(marriage_unknown_excluded$event, na.rm = TRUE),
+  person_years_excluded = sum(
+    marriage_unknown_excluded$stop - marriage_unknown_excluded$start,
+    na.rm = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ---------------------------
+# 5. Sample summaries and common income cutoffs
+# ---------------------------
+sample_summary <- data.frame(
+  stage = c(
+    "Never in common Method A data",
+    "Never main Cox after excluding marriage Unknown"
+  ),
+  persons = c(
+    length(unique(never_data_all$individual_id)),
+    length(unique(never_data$individual_id))
+  ),
+  households = c(
+    length(unique(never_data_all$household_id)),
+    length(unique(never_data$household_id))
+  ),
+  person_intervals = c(
+    nrow(never_data_all),
+    nrow(never_data)
+  ),
+  person_years = c(
+    sum(never_data_all$stop - never_data_all$start, na.rm = TRUE),
+    sum(never_data$stop - never_data$start, na.rm = TRUE)
+  ),
+  death_events = c(
+    sum(never_data_all$event, na.rm = TRUE),
+    sum(never_data$event, na.rm = TRUE)
+  ),
+  stringsAsFactors = FALSE
+)
+
+income_cutoff_table <- data.frame(
+  cutoff = c("33.333%", "66.667%"),
+  value = c(q1, q2),
+  method = "Same Method A common cutoffs generated by revised Ever script",
+  stringsAsFactors = FALSE
+)
+
+# ---------------------------
+# 6. Never Dibao main Cox model
+# ---------------------------
+main_formula <- Surv(start, stop, event) ~
+  sex +
+  income_tertile +
+  marriage_status +
+  living_children +
+  coresident_child +
+  strata(age_group)
+
+main_fit_obj <- fit_cox_with_warnings(
+  main_formula,
+  never_data
+)
+
+main_fit <- main_fit_obj$fit
+main_results <- extract_cox_results(main_fit)
+main_results_readable <- make_readable_main_results(main_results)
+```
+
+
+```{r}
+# 7. PH diagnostic
+# ---------------------------
+main_ph_diag <- run_ph_diagnostic(
+  main_formula,
+  never_data,
+  main_fit
+)
+
+main_ph <- main_ph_diag$object
+main_ph_table <- main_ph_diag$table
+
+ph_diagnostic_info <- data.frame(
+  model = "Never main Cox",
+  diagnostic_source = main_ph_diag$source,
+  primary_error = ifelse(
+    is.na(main_ph_diag$primary_error),
+    "",
+    main_ph_diag$primary_error
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ---------------------------
+# 8. Auxiliary Sex x Marital status analysis
+# ---------------------------
+# The main Cox model keeps all observed substantive marital categories.
+# The auxiliary interaction model is stricter because sex-specific sparse cells
+# can create infinite interaction coefficients.
+sex_marriage_cell_qa <- make_sex_marriage_cell_qa(never_data)
+
+marital_nonref <- setdiff(
+  levels(never_data$marriage_status),
+  "Partnered"
+)
+
+supported_marital_levels <- character(0)
+
+for (lev in marital_nonref) {
+  z <- sex_marriage_cell_qa[
+    sex_marriage_cell_qa$marriage_status == lev &
+      sex_marriage_cell_qa$sex %in% c("Male", "Female"),
+    , drop = FALSE
+  ]
+
+  if (
+    nrow(z) == 2 &&
+      all(z$events >= MIN_EVENTS_PER_SEX_MARRIAGE_CELL)
+  ) {
+    supported_marital_levels <- c(
+      supported_marital_levels,
+      lev
+    )
+  }
+}
+
+sex_marriage_level_eligibility <- do.call(
+  rbind,
+  lapply(marital_nonref, function(lev) {
+    z <- sex_marriage_cell_qa[
+      sex_marriage_cell_qa$marriage_status == lev &
+        sex_marriage_cell_qa$sex %in% c("Male", "Female"),
+      , drop = FALSE
+    ]
+
+    data.frame(
+      marriage_status = lev,
+      male_events = if (any(z$sex == "Male")) {
+        z$events[z$sex == "Male"][1]
+      } else {
+        NA_real_
+      },
+      female_events = if (any(z$sex == "Female")) {
+        z$events[z$sex == "Female"][1]
+      } else {
+        NA_real_
+      },
+      eligible_for_sex_interaction =
+        lev %in% supported_marital_levels,
+      rule = paste0(
+        ">=",
+        MIN_EVENTS_PER_SEX_MARRIAGE_CELL,
+        " deaths in each sex-specific cell"
+      ),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+sex_marriage_fit <- NULL
+sex_marriage_coefficients <- data.frame()
+sex_marriage_block <- data.frame()
+sex_marriage_level_HRs <- data.frame()
+sex_marriage_ph <- NULL
+sex_marriage_ph_table <- data.frame()
+sex_marriage_warnings <- character(0)
+
+if (length(supported_marital_levels) > 0) {
+  sex_marriage_data <- never_data[
+    as.character(never_data$marriage_status) %in%
+      c("Partnered", supported_marital_levels),
+    , drop = FALSE
+  ]
+
+  sex_marriage_data <- droplevels(sex_marriage_data)
+
+  sex_marriage_data$sex <- factor(
+    sex_marriage_data$sex,
+    levels = c("Male", "Female")
+  )
+
+  sex_marriage_data$marriage_status <- factor(
+    sex_marriage_data$marriage_status,
+    levels = c("Partnered", supported_marital_levels)
+  )
+
+  sex_marriage_formula <- Surv(start, stop, event) ~
+    sex * marriage_status +
+    income_tertile +
+    living_children +
+    coresident_child +
+    strata(age_group)
+
+  sex_marriage_obj <- fit_cox_with_warnings(
+    sex_marriage_formula,
+    sex_marriage_data
+  )
+
+  sex_marriage_fit <- sex_marriage_obj$fit
+  sex_marriage_warnings <- sex_marriage_obj$warnings
+  sex_marriage_coefficients <- extract_cox_results(
+    sex_marriage_fit
+  )
+
+  interaction_terms <- grep(
+    ":",
+    names(coef(sex_marriage_fit)),
+    value = TRUE
+  )
+
+  sex_marriage_block <- wald_block(
+    sex_marriage_fit,
+    interaction_terms
+  )
+
+  sex_marriage_block$test <-
+    "Sex x Marital status overall interaction (eligible levels only)"
+
+  sex_marriage_block <- sex_marriage_block[
+    , c("test", "chisq", "df", "p_value")
+  ]
+
+  # Sex-specific marital-status HRs relative to Partnered.
+  for (lev in supported_marital_levels) {
+    main_term <- paste0(
+      "marriage_status",
+      lev
+    )
+
+    male_row <- linear_combination_hr(
+      sex_marriage_fit,
+      setNames(1, main_term),
+      paste0(
+        "Male: ",
+        lev,
+        " vs Partnered"
+      )
+    )
+
+    possible_interactions <- c(
+      paste0(
+        "sexFemale:marriage_status",
+        lev
+      ),
+      paste0(
+        "marriage_status",
+        lev,
+        ":sexFemale"
+      )
+    )
+
+    int_term <- possible_interactions[
+      possible_interactions %in%
+        names(coef(sex_marriage_fit))
+    ]
+
+    if (length(int_term) == 1) {
+      female_row <- linear_combination_hr(
+        sex_marriage_fit,
+        setNames(
+          c(1, 1),
+          c(main_term, int_term)
+        ),
+        paste0(
+          "Female: ",
+          lev,
+          " vs Partnered"
+        )
+      )
+    } else {
+      female_row <- data.frame(
+        label = paste0(
+          "Female: ",
+          lev,
+          " vs Partnered"
+        ),
+        log_HR = NA_real_,
+        SE = NA_real_,
+        HR = NA_real_,
+        lower_95 = NA_real_,
+        upper_95 = NA_real_,
+        p_value = NA_real_
+      )
+    }
+
+    sex_marriage_level_HRs <- rbind(
+      sex_marriage_level_HRs,
+      male_row,
+      female_row
+    )
+  }
+
+  sex_marriage_ph_diag <- run_ph_diagnostic(
+    sex_marriage_formula,
+    sex_marriage_data,
+    sex_marriage_fit
+  )
+
+  sex_marriage_ph <- sex_marriage_ph_diag$object
+  sex_marriage_ph_table <- sex_marriage_ph_diag$table
+
+} else {
+  sex_marriage_block <- data.frame(
+    test = "Sex x Marital status overall interaction",
+    chisq = NA_real_,
+    df = NA_real_,
+    p_value = NA_real_,
+    note = paste0(
+      "Not fitted: no non-reference marital level met the >=",
+      MIN_EVENTS_PER_SEX_MARRIAGE_CELL,
+      " deaths-per-sex rule."
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  sex_marriage_ph_table <- data.frame(
+    term = "NOT_FITTED",
+    chisq = NA_real_,
+    df = NA_real_,
+    p = NA_real_,
+    message = "Sex x Marital status model not fitted because of sparse cells.",
+    diagnostic_source = NA_character_,
+    primary_error = NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------
+# 9. Cell counts / sparse-data QA
+# ---------------------------
+qa_variables <- c(
+  "sex",
+  "income_tertile",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "age_group"
+)
+
+cell_qa <- do.call(
+  rbind,
+  lapply(
+    qa_variables,
+    function(v) make_cell_qa(never_data, v)
+  )
+)
+
+# <5 events is flagged for review, not automatically removed from the main Cox.
+sparse_qa <- cell_qa[
+  cell_qa$events < 5,
+  , drop = FALSE
+]
+```
+
+
+
+```{r}
+# 10. Warning table
+# ---------------------------
+model_warning_table <- data.frame(
+  model = c(
+    rep(
+      "Never main model",
+      length(main_fit_obj$warnings)
+    ),
+    rep(
+      "Never Sex x Marriage model",
+      length(sex_marriage_warnings)
+    )
+  ),
+  warning = c(
+    main_fit_obj$warnings,
+    sex_marriage_warnings
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (nrow(model_warning_table) == 0) {
+  model_warning_table <- data.frame(
+    model = "None",
+    warning = "No coxph warnings captured",
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------
+# 11. PH diagnostic plots
+# ---------------------------
+if (!inherits(main_ph, "cox_zph_error")) {
+  pdf(
+    file.path(
+      OUTPUT_DIR,
+      "A_Never_main_PH_plots.pdf"
+    )
+  )
+  try(plot(main_ph), silent = TRUE)
+  dev.off()
+}
+
+if (
+  !is.null(sex_marriage_ph) &&
+    !inherits(sex_marriage_ph, "cox_zph_error")
+) {
+  pdf(
+    file.path(
+      OUTPUT_DIR,
+      "A_Never_sex_marriage_PH_plots.pdf"
+    )
+  )
+  try(plot(sex_marriage_ph), silent = TRUE)
+  dev.off()
+}
+
+# ---------------------------
+# 12. Save R model/results object
+# ---------------------------
+saveRDS(
+  list(
+    method = "Method A Never Dibao revised",
+    common_rds = COMMON_RDS,
+    income_cutoffs = c(q1 = q1, q2 = q2),
+    never_data_all = never_data_all,
+    never_model_data = never_data,
+    sample_summary = sample_summary,
+    marriage_unknown_exclusion = marriage_unknown_exclusion_summary,
+    main_model = main_fit,
+    main_results = main_results,
+    main_results_readable = main_results_readable,
+    main_ph = main_ph,
+    main_ph_table = main_ph_table,
+    ph_diagnostic_info = ph_diagnostic_info,
+    sex_marriage_model = sex_marriage_fit,
+    sex_marriage_coefficients = sex_marriage_coefficients,
+    sex_marriage_block = sex_marriage_block,
+    sex_marriage_level_HRs = sex_marriage_level_HRs,
+    sex_marriage_cell_qa = sex_marriage_cell_qa,
+    sex_marriage_level_eligibility = sex_marriage_level_eligibility,
+    sex_marriage_ph = sex_marriage_ph,
+    sex_marriage_ph_table = sex_marriage_ph_table,
+    cell_qa = cell_qa,
+    sparse_qa = sparse_qa,
+    warnings = model_warning_table
+  ),
+  file.path(
+    OUTPUT_DIR,
+    "A_Never_models_and_results.rds"
+  )
+)
+```
+
+
+```{r}
+# 13. Excel workbook
+# ---------------------------
+wb <- createWorkbook()
+
+add_sheet(
+  wb,
+  "Sample_Summary",
+  sample_summary
+)
+
+add_sheet(
+  wb,
+  "Tertile_Cutoffs",
+  income_cutoff_table
+)
+
+add_sheet(
+  wb,
+  "Main_Cox",
+  main_results
+)
+
+add_sheet(
+  wb,
+  "Main_Cox_Readable",
+  main_results_readable
+)
+
+add_sheet(
+  wb,
+  "Main_PH",
+  main_ph_table
+)
+
+add_sheet(
+  wb,
+  "PH_Diagnostic_Info",
+  ph_diagnostic_info
+)
+
+add_sheet(
+  wb,
+  "Marriage_Unknown_Excl",
+  marriage_unknown_exclusion_summary
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Cell_QA",
+  sex_marriage_cell_qa
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Eligibility",
+  sex_marriage_level_eligibility
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Block",
+  sex_marriage_block
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Coeff",
+  sex_marriage_coefficients
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_HRs",
+  sex_marriage_level_HRs
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_PH",
+  sex_marriage_ph_table
+)
+
+add_sheet(
+  wb,
+  "Cell_QA",
+  cell_qa
+)
+
+add_sheet(
+  wb,
+  "Sparse_QA",
+  sparse_qa
+)
+
+add_sheet(
+  wb,
+  "Model_Warnings",
+  model_warning_table
+)
+
+saveWorkbook(
+  wb,
+  file.path(
+    OUTPUT_DIR,
+    "A_Never_Dibao_Cox_results.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+# ---------------------------
+# 14. CSV exports
+# ---------------------------
+write.csv(
+  sample_summary,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Sample_Summary.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  main_results,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Main_Cox.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  main_results_readable,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Main_Cox_Readable.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  main_ph_table,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Main_PH.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  marriage_unknown_exclusion_summary,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Marriage_Unknown_Excluded.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_cell_qa,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Cell_QA.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_level_eligibility,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Eligibility.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_block,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Block.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_level_HRs,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Level_HRs.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  cell_qa,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Cell_QA.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sparse_qa,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Sparse_QA.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  model_warning_table,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Model_Warnings.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    OUTPUT_DIR,
+    "A_Never_sessionInfo.txt"
+  )
+)
+
+# ---------------------------
+# 15. Directly display results in R / RStudio
+# ---------------------------
+never_model_summary <- data.frame(
+  metric = c(
+    "Persons in Never main model",
+    "Households in Never main model",
+    "Person-intervals in Never main model",
+    "Person-years in Never main model",
+    "Death events in Never main model",
+    "Income T1/T2 cutoff",
+    "Income T2/T3 cutoff",
+    "Marriage Unknown intervals excluded"
+  ),
+  value = c(
+    length(unique(never_data$individual_id)),
+    length(unique(never_data$household_id)),
+    nrow(never_data),
+    round(sum(never_data$stop - never_data$start, na.rm = TRUE), 3),
+    sum(never_data$event, na.rm = TRUE),
+    round(q1, 4),
+    round(q2, 4),
+    nrow(marriage_unknown_excluded)
+  ),
+  stringsAsFactors = FALSE
+)
+
+print_table_section(
+  "METHOD A - NEVER DIBAO: ANALYSIS SAMPLE",
+  never_model_summary
+)
+
+print_table_section(
+  "MAIN COX RESULTS: HR, 95% CI, AND P VALUE",
+  main_results_readable[
+    , c("comparison", "HR_95CI", "p_display"),
+    drop = FALSE
+  ]
+)
+
+cat("\nFull coxph model summary:\n")
+print(summary(main_fit))
+
+print_table_section(
+  "PROPORTIONAL HAZARDS (PH) DIAGNOSTIC",
+  main_ph_table
+)
+
+print_table_section(
+  "PH DIAGNOSTIC SOURCE",
+  ph_diagnostic_info
+)
+
+print_table_section(
+  "MARRIAGE UNKNOWN EXCLUSION QA",
+  marriage_unknown_exclusion_summary
+)
+
+print_table_section(
+  "SEX x MARITAL STATUS CELL COUNTS",
+  sex_marriage_cell_qa
+)
+
+print_table_section(
+  "SEX x MARITAL STATUS LEVEL ELIGIBILITY",
+  sex_marriage_level_eligibility
+)
+
+print_table_section(
+  "SEX x MARITAL STATUS OVERALL INTERACTION",
+  sex_marriage_block
+)
+
+if (nrow(sex_marriage_level_HRs) > 0) {
+  print_table_section(
+    "SEX-SPECIFIC MARITAL-STATUS HRs",
+    sex_marriage_level_HRs
+  )
+}
+
+print_table_section(
+  "SPARSE-CELL QA (<5 EVENTS)",
+  sparse_qa
+)
+
+print_table_section(
+  "MODEL WARNINGS",
+  model_warning_table
+)
+
+# In RStudio / interactive R, automatically open the most useful tables.
+if (interactive()) {
+  View(
+    main_results_readable,
+    title = "Never Dibao - Main Cox Results"
+  )
+
+  View(
+    main_ph_table,
+    title = "Never Dibao - PH Diagnostic"
+  )
+
+  View(
+    sex_marriage_level_eligibility,
+    title = "Never Dibao - Sex x Marriage Eligibility"
+  )
+}
+
+cat("\n", paste(rep("=", 72), collapse = ""), "\n", sep = "")
+cat("Method A - Never Dibao Cox analysis completed successfully.\n")
+cat(
+  "Common RDS used: ",
+  COMMON_RDS,
+  "\n",
+  sep = ""
+)
+cat(
+  "Never results workbook: ",
+  file.path(OUTPUT_DIR, "A_Never_Dibao_Cox_results.xlsx"),
+  "\n",
+  sep = ""
+)
+cat(
+  "PH diagnostic source: ",
+  main_ph_diag$source,
+  "\n",
+  sep = ""
+)
+cat(
+  "Marriage Unknown intervals excluded from main Cox model: ",
+  nrow(marriage_unknown_excluded),
+  "\n",
+  sep = ""
+)
+cat(paste(rep("=", 72), collapse = ""), "\n", sep = "")
+```
+
+
+
+
+
+```{r}
+# Method A - Never Dibao: Cox models with HUKOU adjustment.
+# Uses the SAME common RDS already generated by the updated Ever script.
+# No re-reading CSV files, no Ever rerun, no new cleaning of the common data.
+# HUKOU was fixed in the Ever common data at the FIRST non-missing wave
+# (2011, 2013, 2015, 2018, 2020); 2=non-agricultural reference,
+# 1=agricultural comparison; later HUKOU changes are ignored.
+# Exclude missing HUKOU only at the Cox model-data stage.
+
+# 0. Settings
+# ---------------------------
+DATA_DIR <- "."
+OUTPUT_DIR <- file.path(DATA_DIR, "A_Cox_outputs")
+COMMON_RDS <- file.path(OUTPUT_DIR, "A_Cox_common_data.rds")
+
+# Diagnostic rule for the auxiliary Sex x Marriage analysis.
+# This is a prespecified stability screen for the interaction model, not a
+# substantive population threshold.
+MIN_EVENTS_PER_SEX_MARRIAGE_CELL <- 5L
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "csv"), showWarnings = FALSE, recursive = TRUE)
+
+required_packages <- c("survival", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+library(survival)
+library(openxlsx)
+
+options(stringsAsFactors = FALSE)
+
+if (!file.exists(COMMON_RDS)) {
+  stop(
+    "A_Cox_common_data.rds was not found at: ", COMMON_RDS, "\n",
+    "Please use the existing common RDS generated by the UPDATED Ever ",
+    "Dibao HUKOU script. Never must use the same income cutoffs."
+  )
+}
+# 1. Helper functions
+# ---------------------------
+fit_cox_with_warnings <- function(formula, data) {
+  warnings_seen <- character(0)
+
+  fit <- withCallingHandlers(
+    coxph(
+      formula,
+      data = data,
+      ties = "efron",
+      cluster = individual_id,
+      robust = TRUE,
+      x = TRUE,
+      model = TRUE
+    ),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  list(
+    fit = fit,
+    warnings = unique(warnings_seen)
+  )
+}
+
+extract_cox_results <- function(fit) {
+  s <- summary(fit)
+  coef_table <- as.data.frame(s$coefficients)
+  ci_table <- as.data.frame(s$conf.int)
+
+  out <- data.frame(
+    term = rownames(coef_table),
+    beta = coef_table[, "coef"],
+    HR = ci_table[, "exp(coef)"],
+    lower_95 = ci_table[, "lower .95"],
+    upper_95 = ci_table[, "upper .95"],
+    p_value = coef_table[, "Pr(>|z|)"],
+    row.names = NULL,
+    check.names = FALSE
+  )
+
+  if ("robust se" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "robust se"]
+  } else if ("se(coef)" %in% names(coef_table)) {
+    out$robust_se <- coef_table[, "se(coef)"]
+  } else {
+    out$robust_se <- NA_real_
+  }
+
+  out[, c(
+    "term", "beta", "robust_se", "HR",
+    "lower_95", "upper_95", "p_value"
+  )]
+}
+
+make_readable_main_results <- function(x) {
+  label_map <- c(
+    "sexFemale" = "Female vs Male",
+    "income_tertileT2" = "Income T2 vs T1",
+    "income_tertileT3" = "Income T3 vs T1",
+    "marriage_statusWidowed" = "Widowed vs Partnered",
+    "marriage_statusSeparated-Divorced" = "Separated/Divorced vs Partnered",
+    "marriage_statusNever married" = "Never married vs Partnered",
+    "living_children1" = "1 living child vs 0",
+    "living_children2" = "2 living children vs 0",
+    "living_children3+" = "3+ living children vs 0",
+    "living_childrenUnknown" = "Living children Unknown vs 0",
+    "coresident_childYes" = "Coresident child Yes vs No",
+    "coresident_childUnknown" = "Coresident child Unknown vs No",
+    "hukouAgricultural" = "Agricultural Hukou vs Non-agricultural Hukou"
+  )
+
+  out <- x
+
+  out$comparison <- ifelse(
+    out$term %in% names(label_map),
+    unname(label_map[out$term]),
+    out$term
+  )
+
+  out$HR_95CI <- sprintf(
+    "%.3f (%.3f-%.3f)",
+    out$HR, out$lower_95, out$upper_95
+  )
+
+  out$p_display <- ifelse(
+    is.na(out$p_value),
+    NA_character_,
+    ifelse(out$p_value < 0.001, "<0.001", sprintf("%.3f", out$p_value))
+  )
+
+  out[, c(
+    "comparison", "HR_95CI", "p_display",
+    "beta", "robust_se", "HR", "lower_95", "upper_95", "p_value"
+  )]
+}
+
+safe_cox_zph <- function(fit) {
+  tryCatch(
+    cox.zph(
+      fit,
+      transform = "km",
+      terms = TRUE,
+      global = TRUE
+    ),
+    error = function(e) {
+      structure(
+        list(message = conditionMessage(e)),
+        class = "cox_zph_error"
+      )
+    }
+  )
+}
+
+ph_table <- function(ph_object) {
+  if (inherits(ph_object, "cox_zph_error")) {
+    return(data.frame(
+      term = "PH_TEST_ERROR",
+      chisq = NA_real_,
+      df = NA_real_,
+      p = NA_real_,
+      message = ph_object$message,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  x <- as.data.frame(ph_object$table)
+  x$term <- rownames(x)
+  rownames(x) <- NULL
+
+  x[, c("term", setdiff(names(x), "term")), drop = FALSE]
+}
+
+# First try cox.zph() on the formal clustered robust Cox fit.
+# If that covariance is computationally singular, fit the EXACT SAME Cox
+# formula without cluster/robust ONLY as a PH diagnostic fallback.
+# The fallback does NOT replace the main HR model.
+run_ph_diagnostic <- function(formula, data, clustered_fit) {
+  primary <- safe_cox_zph(clustered_fit)
+
+  if (!inherits(primary, "cox_zph_error")) {
+    tab <- ph_table(primary)
+    tab$diagnostic_source <- "clustered robust Cox fit"
+    tab$primary_error <- NA_character_
+
+    return(list(
+      object = primary,
+      table = tab,
+      source = "clustered robust Cox fit",
+      primary_error = NA_character_
+    ))
+  }
+
+  diagnostic_fit <- coxph(
+    formula,
+    data = data,
+    ties = "efron",
+    x = TRUE,
+    model = TRUE
+  )
+
+  fallback <- safe_cox_zph(diagnostic_fit)
+  tab <- ph_table(fallback)
+  tab$diagnostic_source <- "same formula, unclustered diagnostic fallback"
+  tab$primary_error <- primary$message
+
+  list(
+    object = fallback,
+    table = tab,
+    source = "same formula, unclustered diagnostic fallback",
+    primary_error = primary$message
+  )
+}
+
+wald_block <- function(fit, coefficient_names) {
+  b_all <- coef(fit)
+  coefficient_names <- intersect(coefficient_names, names(b_all))
+
+  if (length(coefficient_names) == 0) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_
+    ))
+  }
+
+  b <- b_all[coefficient_names]
+  V <- vcov(fit)[coefficient_names, coefficient_names, drop = FALSE]
+
+  ok <- is.finite(b)
+  if (!all(ok)) {
+    b <- b[ok]
+    V <- V[ok, ok, drop = FALSE]
+  }
+
+  if (length(b) == 0 || any(!is.finite(V))) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_
+    ))
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(abs(ee$values)) * 1e-10
+  keep <- ee$values > tol
+
+  if (!any(keep)) {
+    return(data.frame(
+      chisq = NA_real_,
+      df = 0L,
+      p_value = NA_real_
+    ))
+  }
+
+  Vinv <- ee$vectors[, keep, drop = FALSE] %*%
+    diag(1 / ee$values[keep], nrow = sum(keep)) %*%
+    t(ee$vectors[, keep, drop = FALSE])
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  df <- sum(keep)
+  p <- pchisq(W, df = df, lower.tail = FALSE)
+
+  data.frame(
+    chisq = W,
+    df = df,
+    p_value = p
+  )
+}
+
+linear_combination_hr <- function(fit, weights, label) {
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  missing_terms <- setdiff(names(weights), names(b))
+
+  if (
+    length(missing_terms) > 0 ||
+      any(!is.finite(b[names(weights)])) ||
+      any(!is.finite(V[names(weights), names(weights), drop = FALSE]))
+  ) {
+    return(data.frame(
+      label = label,
+      log_HR = NA_real_,
+      SE = NA_real_,
+      HR = NA_real_,
+      lower_95 = NA_real_,
+      upper_95 = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  w <- rep(0, length(b))
+  names(w) <- names(b)
+  w[names(weights)] <- weights
+
+  est <- sum(w * b)
+  se <- sqrt(as.numeric(t(w) %*% V %*% w))
+  z <- est / se
+
+  data.frame(
+    label = label,
+    log_HR = est,
+    SE = se,
+    HR = exp(est),
+    lower_95 = exp(est - 1.96 * se),
+    upper_95 = exp(est + 1.96 * se),
+    p_value = 2 * pnorm(abs(z), lower.tail = FALSE)
+  )
+}
+
+make_cell_qa <- function(data, variable) {
+  levs <- levels(data[[variable]])
+
+  if (is.null(levs)) {
+    levs <- sort(unique(as.character(data[[variable]])))
+  }
+
+  out <- lapply(levs, function(z) {
+    d <- data[
+      as.character(data[[variable]]) == z,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      variable = variable,
+      level = z,
+      records = nrow(d),
+      persons = length(unique(d$individual_id)),
+      events = sum(d$event, na.rm = TRUE),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+make_sex_marriage_cell_qa <- function(data) {
+  sexes <- levels(data$sex)
+  marriages <- levels(data$marriage_status)
+
+  grid <- expand.grid(
+    sex = sexes,
+    marriage_status = marriages,
+    stringsAsFactors = FALSE
+  )
+
+  out <- lapply(seq_len(nrow(grid)), function(i) {
+    sx <- grid$sex[i]
+    ms <- grid$marriage_status[i]
+
+    d <- data[
+      as.character(data$sex) == sx &
+        as.character(data$marriage_status) == ms,
+      , drop = FALSE
+    ]
+
+    data.frame(
+      sex = sx,
+      marriage_status = ms,
+      records = nrow(d),
+      persons = length(unique(d$individual_id)),
+      events = sum(d$event, na.rm = TRUE),
+      person_years = sum(d$stop - d$start, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+print_table_section <- function(title, x, digits = 4) {
+  cat("\n", paste(rep("=", 72), collapse = ""), "\n", sep = "")
+  cat(title, "\n")
+  cat(paste(rep("=", 72), collapse = ""), "\n", sep = "")
+
+  if (is.null(x)) {
+    cat("No result available.\n")
+  } else {
+    print(x, row.names = FALSE, digits = digits)
+  }
+}
+
+add_sheet <- function(wb, name, x) {
+  addWorksheet(wb, name)
+  writeData(wb, name, x)
+}
+
+# Checks that one person's start-stop intervals do not overlap.
+check_nonoverlap <- function(data) {
+  ids <- unique(data$individual_id)
+  bad <- character(0)
+
+  for (id in ids) {
+    d <- data[data$individual_id == id, , drop = FALSE]
+    d <- d[order(d$start, d$stop), , drop = FALSE]
+
+    if (nrow(d) > 1) {
+      overlap <- d$start[-1] < d$stop[-nrow(d)]
+      if (any(overlap, na.rm = TRUE)) {
+        bad <- c(bad, id)
+      }
+    }
+  }
+
+  unique(bad)
+}
+
+# ---------------------------
+# 2. Read and validate the common Method A object
+# ---------------------------
+common <- readRDS(COMMON_RDS)
+
+required_common_objects <- c(
+  "analysis_intervals",
+  "income_cutoffs",
+  "sample_flow",
+  "group_summary",
+  "hukou_qa"
+)
+
+missing_common_objects <- setdiff(
+  required_common_objects,
+  names(common)
+)
+
+if (length(missing_common_objects) > 0) {
+  stop(
+    "The common RDS is missing required object(s): ",
+    paste(missing_common_objects, collapse = ", ")
+  )
+}
+
+analysis_intervals <- common$analysis_intervals
+
+required_columns <- c(
+  "individual_id",
+  "household_id",
+  "dibao_group",
+  "start",
+  "stop",
+  "event",
+  "person_years",
+  "sex",
+  "income_tertile",
+  "long_mean_household_income_pc",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "hukou",
+  "hukou_fixed",
+  "hukou_first_wave",
+  "hukou_conflict",
+  "age_group"
+)
+
+missing_columns <- setdiff(
+  required_columns,
+  names(analysis_intervals)
+)
+
+if (length(missing_columns) > 0) {
+  stop(
+    "analysis_intervals is missing required column(s): ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+# Validate the shared HUKOU recoding and avoid silently using an old common RDS.
+# These checks do not alter the data.
+raw_hukou <- analysis_intervals$hukou_fixed
+if (any(!is.na(raw_hukou) & !(raw_hukou %in% c(1, 2)))) {
+  stop("Unexpected HUKOU raw value in common RDS (expected 1 or 2).")
+}
+expected_hukou <- ifelse(
+  is.na(raw_hukou), NA_character_,
+  ifelse(raw_hukou == 1, "Agricultural", "Non-agricultural")
+)
+if (!identical(as.character(analysis_intervals$hukou), expected_hukou)) {
+  stop("HUKOU recoding in common RDS is inconsistent with 1/2 coding.")
+}
+if (any(!is.na(analysis_intervals$hukou_first_wave) &
+        !(analysis_intervals$hukou_first_wave %in%
+            c(2011, 2013, 2015, 2018, 2020)))) {
+  stop("Unexpected HUKOU first-valid wave in common RDS.")
+}
+if (any(is.na(raw_hukou) != is.na(analysis_intervals$hukou_first_wave))) {
+  stop("HUKOU first-valid wave and HUKOU missingness are inconsistent.")
+}
+
+if (length(common$income_cutoffs) != 2 ||
+    any(!is.finite(common$income_cutoffs))) {
+  stop("The common RDS does not contain two valid finite income cutoffs.")
+}
+
+q1 <- as.numeric(common$income_cutoffs[1])
+q2 <- as.numeric(common$income_cutoffs[2])
+
+if (!(q1 < q2)) {
+  stop("Income cutoffs are invalid: q1 must be smaller than q2.")
+}
+
+# ---------------------------
+# 3. Select Never Dibao records
+# ---------------------------
+never_data_all <- analysis_intervals[
+  as.character(analysis_intervals$dibao_group) == "Never",
+  , drop = FALSE
+]
+
+if (nrow(never_data_all) == 0) {
+  stop("No Never Dibao person-period records were found in the common RDS.")
+}
+
+# Basic integrity checks before modeling.
+if (any(is.na(never_data_all$start)) ||
+    any(is.na(never_data_all$stop))) {
+  stop("Never data contain missing start or stop times.")
+}
+
+if (any(never_data_all$stop <= never_data_all$start)) {
+  stop("Never data contain stop <= start intervals.")
+}
+
+if (any(!never_data_all$event %in% c(0, 1))) {
+  stop("Never data contain event values other than 0/1.")
+}
+
+events_per_person <- tapply(
+  never_data_all$event,
+  never_data_all$individual_id,
+  sum,
+  na.rm = TRUE
+)
+
+if (any(events_per_person > 1)) {
+  stop("At least one Never participant has more than one death event.")
+}
+
+bad_overlap <- check_nonoverlap(never_data_all)
+if (length(bad_overlap) > 0) {
+  stop(
+    "Overlapping person-period intervals detected for ",
+    length(bad_overlap),
+    " Never participant(s). First IDs: ",
+    paste(head(bad_overlap, 10), collapse = ", ")
+  )
+}
+# 4. Marriage Unknown handling for the formal Never Cox model
+# ---------------------------
+# In the current common sample, marriage Unknown is a very sparse category
+# and has no death events in Never. It is retained in the common object and QA,
+# but excluded from the Cox model intervals rather than estimating an unstable
+# zero-event coefficient.
+marriage_unknown_excluded <- never_data_all[
+  as.character(never_data_all$marriage_status) == "Unknown",
+  , drop = FALSE
+]
+
+# Match Ever: first exclude marriage Unknown from the Cox sample,
+# then exclude intervals with HUKOU missing across ALL available waves.
+# Keep these rows in the common RDS and in the exclusion QA tables.
+never_after_marriage <- never_data_all[
+  as.character(never_data_all$marriage_status) != "Unknown",
+  , drop = FALSE
+]
+
+hukou_missing_excluded <- never_after_marriage[
+  is.na(never_after_marriage$hukou), , drop = FALSE
+]
+never_data <- never_after_marriage[
+  !is.na(never_after_marriage$hukou), , drop = FALSE
+]
+never_data <- droplevels(never_data)
+
+# Re-assert reference categories and factor order.
+never_data$sex <- factor(
+  never_data$sex,
+  levels = c("Male", "Female")
+)
+
+never_data$income_tertile <- factor(
+  never_data$income_tertile,
+  levels = c("T1", "T2", "T3")
+)
+
+never_data$marriage_status <- factor(
+  never_data$marriage_status,
+  levels = c(
+    "Partnered",
+    "Widowed",
+    "Separated-Divorced",
+    "Never married"
+  )
+)
+
+never_data$living_children <- factor(
+  never_data$living_children,
+  levels = c("0", "1", "2", "3+", "Unknown")
+)
+
+never_data$coresident_child <- factor(
+  never_data$coresident_child,
+  levels = c("No", "Yes", "Unknown")
+)
+
+# Non-agricultural Hukou is the shared reference group in Ever and Never.
+never_data$hukou <- factor(
+  never_data$hukou,
+  levels = c("Non-agricultural", "Agricultural")
+)
+
+never_data$age_group <- factor(
+  never_data$age_group,
+  levels = c("45-54", "55-64", "65-74", "75-84", "85-94", "95+")
+)
+
+if (any(is.na(never_data$sex))) {
+  stop("Missing sex found in final Never Cox model data.")
+}
+
+if (any(is.na(never_data$income_tertile))) {
+  stop("Missing income tertile found in final Never Cox model data.")
+}
+
+if (any(is.na(never_data$marriage_status))) {
+  stop("Unexpected marriage-status code found after Never recoding/filtering.")
+}
+
+if (any(is.na(never_data$age_group))) {
+  stop("Missing age group found in final Never Cox model data.")
+}
+
+if (any(is.na(never_data$hukou))) {
+  stop("Missing HUKOU found after exclusion from Never Cox model data.")
+}
+if (nrow(never_data) == 0 ||
+    length(unique(as.character(never_data$hukou))) < 2L) {
+  stop("Never Cox model requires observations in both HUKOU categories.")
+}
+
+if (sum(never_data$event, na.rm = TRUE) == 0) {
+  stop("No death events remain in the Never Cox model data.")
+}
+
+marriage_unknown_exclusion_summary <- data.frame(
+  rule = "Marriage status Unknown excluded from Cox model intervals",
+  records_excluded = nrow(marriage_unknown_excluded),
+  persons_affected = length(unique(marriage_unknown_excluded$individual_id)),
+  events_excluded = sum(marriage_unknown_excluded$event, na.rm = TRUE),
+  person_years_excluded = sum(
+    marriage_unknown_excluded$stop - marriage_unknown_excluded$start,
+    na.rm = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Same HUKOU-missing exclusion definition and summary as Ever.
+hukou_missing_exclusion_summary <- data.frame(
+  rule = "First non-missing HUKOU absent in all waves: excluded from Cox",
+  records_excluded = nrow(hukou_missing_excluded),
+  persons_affected = length(unique(hukou_missing_excluded$individual_id)),
+  events_excluded = sum(hukou_missing_excluded$event, na.rm = TRUE),
+  person_years_excluded = sum(
+    hukou_missing_excluded$stop - hukou_missing_excluded$start,
+    na.rm = TRUE
+  ),
+  stringsAsFactors = FALSE
+)
+
+# HUKOU QA was calculated from person histories by the updated Ever script.
+# Reuse exactly that shared QA; do not recalculate from the Cox subset.
+hukou_qa <- common$hukou_qa
+
+# ---------------------------
+# 5. Sample summaries and common income cutoffs
+# ---------------------------
+sample_summary <- data.frame(
+  stage = c(
+    "Never in common Method A data",
+    "Never after excluding marriage Unknown",
+    "Never main Cox after excluding marriage Unknown and HUKOU missing"
+  ),
+  persons = c(
+    length(unique(never_data_all$individual_id)),
+    length(unique(never_after_marriage$individual_id)),
+    length(unique(never_data$individual_id))
+  ),
+  households = c(
+    length(unique(never_data_all$household_id)),
+    length(unique(never_after_marriage$household_id)),
+    length(unique(never_data$household_id))
+  ),
+  person_intervals = c(
+    nrow(never_data_all),
+    nrow(never_after_marriage),
+    nrow(never_data)
+  ),
+  person_years = c(
+    sum(never_data_all$stop - never_data_all$start, na.rm = TRUE),
+    sum(never_after_marriage$stop - never_after_marriage$start, na.rm = TRUE),
+    sum(never_data$stop - never_data$start, na.rm = TRUE)
+  ),
+  death_events = c(
+    sum(never_data_all$event, na.rm = TRUE),
+    sum(never_after_marriage$event, na.rm = TRUE),
+    sum(never_data$event, na.rm = TRUE)
+  ),
+  stringsAsFactors = FALSE
+)
+
+income_cutoff_table <- data.frame(
+  cutoff = c("33.333%", "66.667%"),
+  value = c(q1, q2),
+  method = "Same Method A common cutoffs generated by revised Ever script",
+  stringsAsFactors = FALSE
+)
+
+# ---------------------------
+# 6. Never Dibao main Cox model
+# ---------------------------
+main_formula <- Surv(start, stop, event) ~
+  sex +
+  income_tertile +
+  marriage_status +
+  living_children +
+  coresident_child +
+  hukou +
+  strata(age_group)
+
+main_fit_obj <- fit_cox_with_warnings(
+  main_formula,
+  never_data
+)
+
+main_fit <- main_fit_obj$fit
+main_results <- extract_cox_results(main_fit)
+main_results_readable <- make_readable_main_results(main_results)
+# 7. PH diagnostic
+# ---------------------------
+main_ph_diag <- run_ph_diagnostic(
+  main_formula,
+  never_data,
+  main_fit
+)
+
+main_ph <- main_ph_diag$object
+main_ph_table <- main_ph_diag$table
+
+ph_diagnostic_info <- data.frame(
+  model = "Never main Cox",
+  diagnostic_source = main_ph_diag$source,
+  primary_error = ifelse(
+    is.na(main_ph_diag$primary_error),
+    "",
+    main_ph_diag$primary_error
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ---------------------------
+# 8. Auxiliary Sex x Marital status analysis
+# ---------------------------
+# The main Cox model keeps all observed substantive marital categories.
+# The auxiliary interaction model is stricter because sex-specific sparse cells
+# can create infinite interaction coefficients.
+sex_marriage_cell_qa <- make_sex_marriage_cell_qa(never_data)
+
+marital_nonref <- setdiff(
+  levels(never_data$marriage_status),
+  "Partnered"
+)
+
+supported_marital_levels <- character(0)
+
+for (lev in marital_nonref) {
+  z <- sex_marriage_cell_qa[
+    sex_marriage_cell_qa$marriage_status == lev &
+      sex_marriage_cell_qa$sex %in% c("Male", "Female"),
+    , drop = FALSE
+  ]
+
+  if (
+    nrow(z) == 2 &&
+      all(z$events >= MIN_EVENTS_PER_SEX_MARRIAGE_CELL)
+  ) {
+    supported_marital_levels <- c(
+      supported_marital_levels,
+      lev
+    )
+  }
+}
+
+sex_marriage_level_eligibility <- do.call(
+  rbind,
+  lapply(marital_nonref, function(lev) {
+    z <- sex_marriage_cell_qa[
+      sex_marriage_cell_qa$marriage_status == lev &
+        sex_marriage_cell_qa$sex %in% c("Male", "Female"),
+      , drop = FALSE
+    ]
+
+    data.frame(
+      marriage_status = lev,
+      male_events = if (any(z$sex == "Male")) {
+        z$events[z$sex == "Male"][1]
+      } else {
+        NA_real_
+      },
+      female_events = if (any(z$sex == "Female")) {
+        z$events[z$sex == "Female"][1]
+      } else {
+        NA_real_
+      },
+      eligible_for_sex_interaction =
+        lev %in% supported_marital_levels,
+      rule = paste0(
+        ">=",
+        MIN_EVENTS_PER_SEX_MARRIAGE_CELL,
+        " deaths in each sex-specific cell"
+      ),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+sex_marriage_fit <- NULL
+sex_marriage_coefficients <- data.frame()
+sex_marriage_block <- data.frame()
+sex_marriage_level_HRs <- data.frame()
+sex_marriage_ph <- NULL
+sex_marriage_ph_table <- data.frame()
+sex_marriage_warnings <- character(0)
+
+if (length(supported_marital_levels) > 0) {
+  sex_marriage_data <- never_data[
+    as.character(never_data$marriage_status) %in%
+      c("Partnered", supported_marital_levels),
+    , drop = FALSE
+  ]
+
+  sex_marriage_data <- droplevels(sex_marriage_data)
+
+  sex_marriage_data$sex <- factor(
+    sex_marriage_data$sex,
+    levels = c("Male", "Female")
+  )
+
+  sex_marriage_data$marriage_status <- factor(
+    sex_marriage_data$marriage_status,
+    levels = c("Partnered", supported_marital_levels)
+  )
+
+  sex_marriage_formula <- Surv(start, stop, event) ~
+    sex * marriage_status +
+    income_tertile +
+    living_children +
+    coresident_child +
+    hukou +
+    strata(age_group)
+
+  sex_marriage_obj <- fit_cox_with_warnings(
+    sex_marriage_formula,
+    sex_marriage_data
+  )
+
+  sex_marriage_fit <- sex_marriage_obj$fit
+  sex_marriage_warnings <- sex_marriage_obj$warnings
+  sex_marriage_coefficients <- extract_cox_results(
+    sex_marriage_fit
+  )
+
+  interaction_terms <- grep(
+    ":",
+    names(coef(sex_marriage_fit)),
+    value = TRUE
+  )
+
+  sex_marriage_block <- wald_block(
+    sex_marriage_fit,
+    interaction_terms
+  )
+
+  sex_marriage_block$test <-
+    "Sex x Marital status overall interaction (eligible levels only)"
+
+  sex_marriage_block <- sex_marriage_block[
+    , c("test", "chisq", "df", "p_value")
+  ]
+
+  # Sex-specific marital-status HRs relative to Partnered.
+  for (lev in supported_marital_levels) {
+    main_term <- paste0(
+      "marriage_status",
+      lev
+    )
+
+    male_row <- linear_combination_hr(
+      sex_marriage_fit,
+      setNames(1, main_term),
+      paste0(
+        "Male: ",
+        lev,
+        " vs Partnered"
+      )
+    )
+
+    possible_interactions <- c(
+      paste0(
+        "sexFemale:marriage_status",
+        lev
+      ),
+      paste0(
+        "marriage_status",
+        lev,
+        ":sexFemale"
+      )
+    )
+
+    int_term <- possible_interactions[
+      possible_interactions %in%
+        names(coef(sex_marriage_fit))
+    ]
+
+    if (length(int_term) == 1) {
+      female_row <- linear_combination_hr(
+        sex_marriage_fit,
+        setNames(
+          c(1, 1),
+          c(main_term, int_term)
+        ),
+        paste0(
+          "Female: ",
+          lev,
+          " vs Partnered"
+        )
+      )
+    } else {
+      female_row <- data.frame(
+        label = paste0(
+          "Female: ",
+          lev,
+          " vs Partnered"
+        ),
+        log_HR = NA_real_,
+        SE = NA_real_,
+        HR = NA_real_,
+        lower_95 = NA_real_,
+        upper_95 = NA_real_,
+        p_value = NA_real_
+      )
+    }
+
+    sex_marriage_level_HRs <- rbind(
+      sex_marriage_level_HRs,
+      male_row,
+      female_row
+    )
+  }
+
+  sex_marriage_ph_diag <- run_ph_diagnostic(
+    sex_marriage_formula,
+    sex_marriage_data,
+    sex_marriage_fit
+  )
+
+  sex_marriage_ph <- sex_marriage_ph_diag$object
+  sex_marriage_ph_table <- sex_marriage_ph_diag$table
+
+} else {
+  sex_marriage_block <- data.frame(
+    test = "Sex x Marital status overall interaction",
+    chisq = NA_real_,
+    df = NA_real_,
+    p_value = NA_real_,
+    note = paste0(
+      "Not fitted: no non-reference marital level met the >=",
+      MIN_EVENTS_PER_SEX_MARRIAGE_CELL,
+      " deaths-per-sex rule."
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  sex_marriage_ph_table <- data.frame(
+    term = "NOT_FITTED",
+    chisq = NA_real_,
+    df = NA_real_,
+    p = NA_real_,
+    message = "Sex x Marital status model not fitted because of sparse cells.",
+    diagnostic_source = NA_character_,
+    primary_error = NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------
+# 9. Cell counts / sparse-data QA
+# ---------------------------
+qa_variables <- c(
+  "sex",
+  "income_tertile",
+  "marriage_status",
+  "living_children",
+  "coresident_child",
+  "hukou",
+  "age_group"
+)
+
+cell_qa <- do.call(
+  rbind,
+  lapply(
+    qa_variables,
+    function(v) make_cell_qa(never_data, v)
+  )
+)
+
+# <5 events is flagged for review, not automatically removed from the main Cox.
+sparse_qa <- cell_qa[
+  cell_qa$events < 5,
+  , drop = FALSE
+]
+# 10. Warning table
+# ---------------------------
+model_warning_table <- data.frame(
+  model = c(
+    rep(
+      "Never main model",
+      length(main_fit_obj$warnings)
+    ),
+    rep(
+      "Never Sex x Marriage model",
+      length(sex_marriage_warnings)
+    )
+  ),
+  warning = c(
+    main_fit_obj$warnings,
+    sex_marriage_warnings
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (nrow(model_warning_table) == 0) {
+  model_warning_table <- data.frame(
+    model = "None",
+    warning = "No coxph warnings captured",
+    stringsAsFactors = FALSE
+  )
+}
+
+# ---------------------------
+# 11. PH diagnostic plots
+# ---------------------------
+if (!inherits(main_ph, "cox_zph_error")) {
+  pdf(
+    file.path(
+      OUTPUT_DIR,
+      "A_Never_main_PH_plots.pdf"
+    )
+  )
+  try(plot(main_ph), silent = TRUE)
+  dev.off()
+}
+
+if (
+  !is.null(sex_marriage_ph) &&
+    !inherits(sex_marriage_ph, "cox_zph_error")
+) {
+  pdf(
+    file.path(
+      OUTPUT_DIR,
+      "A_Never_sex_marriage_PH_plots.pdf"
+    )
+  )
+  try(plot(sex_marriage_ph), silent = TRUE)
+  dev.off()
+}
+
+# ---------------------------
+# 12. Save R model/results object
+# ---------------------------
+saveRDS(
+  list(
+    method = "Method A Never Dibao revised",
+    common_rds = COMMON_RDS,
+    income_cutoffs = c(q1 = q1, q2 = q2),
+    never_data_all = never_data_all,
+    never_model_data = never_data,
+    sample_summary = sample_summary,
+    marriage_unknown_exclusion = marriage_unknown_exclusion_summary,
+    hukou_missing_exclusion = hukou_missing_exclusion_summary,
+    hukou_qa = hukou_qa,
+    main_model = main_fit,
+    main_results = main_results,
+    main_results_readable = main_results_readable,
+    main_ph = main_ph,
+    main_ph_table = main_ph_table,
+    ph_diagnostic_info = ph_diagnostic_info,
+    sex_marriage_model = sex_marriage_fit,
+    sex_marriage_coefficients = sex_marriage_coefficients,
+    sex_marriage_block = sex_marriage_block,
+    sex_marriage_level_HRs = sex_marriage_level_HRs,
+    sex_marriage_cell_qa = sex_marriage_cell_qa,
+    sex_marriage_level_eligibility = sex_marriage_level_eligibility,
+    sex_marriage_ph = sex_marriage_ph,
+    sex_marriage_ph_table = sex_marriage_ph_table,
+    cell_qa = cell_qa,
+    sparse_qa = sparse_qa,
+    warnings = model_warning_table
+  ),
+  file.path(
+    OUTPUT_DIR,
+    "A_Never_models_and_results.rds"
+  )
+)
+# 13. Excel workbook
+# ---------------------------
+wb <- createWorkbook()
+
+add_sheet(
+  wb,
+  "Sample_Summary",
+  sample_summary
+)
+
+add_sheet(
+  wb,
+  "Tertile_Cutoffs",
+  income_cutoff_table
+)
+
+add_sheet(
+  wb,
+  "Main_Cox",
+  main_results
+)
+
+add_sheet(
+  wb,
+  "Main_Cox_Readable",
+  main_results_readable
+)
+
+add_sheet(
+  wb,
+  "Main_PH",
+  main_ph_table
+)
+
+add_sheet(
+  wb,
+  "PH_Diagnostic_Info",
+  ph_diagnostic_info
+)
+
+add_sheet(
+  wb,
+  "Marriage_Unknown_Excl",
+  marriage_unknown_exclusion_summary
+)
+
+add_sheet(
+  wb,
+  "Hukou_Missing_Excl",
+  hukou_missing_exclusion_summary
+)
+
+add_sheet(
+  wb,
+  "Hukou_QA",
+  hukou_qa
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Cell_QA",
+  sex_marriage_cell_qa
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Eligibility",
+  sex_marriage_level_eligibility
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Block",
+  sex_marriage_block
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_Coeff",
+  sex_marriage_coefficients
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_HRs",
+  sex_marriage_level_HRs
+)
+
+add_sheet(
+  wb,
+  "SexMarriage_PH",
+  sex_marriage_ph_table
+)
+
+add_sheet(
+  wb,
+  "Cell_QA",
+  cell_qa
+)
+
+add_sheet(
+  wb,
+  "Sparse_QA",
+  sparse_qa
+)
+
+add_sheet(
+  wb,
+  "Model_Warnings",
+  model_warning_table
+)
+
+saveWorkbook(
+  wb,
+  file.path(
+    OUTPUT_DIR,
+    "A_Never_Dibao_Cox_results.xlsx"
+  ),
+  overwrite = TRUE
+)
+
+# ---------------------------
+# 14. CSV exports
+# ---------------------------
+write.csv(
+  sample_summary,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Sample_Summary.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  main_results,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Main_Cox.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  main_results_readable,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Main_Cox_Readable.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  main_ph_table,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Main_PH.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  marriage_unknown_exclusion_summary,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Marriage_Unknown_Excluded.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  hukou_missing_exclusion_summary,
+  file.path(OUTPUT_DIR, "csv", "A_Never_Hukou_Missing_Excluded.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  hukou_qa,
+  file.path(OUTPUT_DIR, "csv", "A_Never_Hukou_QA.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_cell_qa,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Cell_QA.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_level_eligibility,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Eligibility.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_block,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Block.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sex_marriage_level_HRs,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_SexMarriage_Level_HRs.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  cell_qa,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Cell_QA.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  sparse_qa,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Sparse_QA.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  model_warning_table,
+  file.path(
+    OUTPUT_DIR,
+    "csv",
+    "A_Never_Model_Warnings.csv"
+  ),
+  row.names = FALSE,
+  na = ""
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    OUTPUT_DIR,
+    "A_Never_sessionInfo.txt"
+  )
+)
+
+# ---------------------------
+# 15. Directly display results in R / RStudio
+# ---------------------------
+never_model_summary <- data.frame(
+  metric = c(
+    "Persons in Never main model",
+    "Households in Never main model",
+    "Person-intervals in Never main model",
+    "Person-years in Never main model",
+    "Death events in Never main model",
+    "Income T1/T2 cutoff",
+    "Income T2/T3 cutoff",
+    "Marriage Unknown intervals excluded",
+    "HUKOU-missing intervals excluded",
+    "HUKOU-missing persons affected",
+    "HUKOU-missing death events excluded"
+  ),
+  value = c(
+    length(unique(never_data$individual_id)),
+    length(unique(never_data$household_id)),
+    nrow(never_data),
+    round(sum(never_data$stop - never_data$start, na.rm = TRUE), 3),
+    sum(never_data$event, na.rm = TRUE),
+    round(q1, 4),
+    round(q2, 4),
+    nrow(marriage_unknown_excluded),
+    nrow(hukou_missing_excluded),
+    length(unique(hukou_missing_excluded$individual_id)),
+    sum(hukou_missing_excluded$event, na.rm = TRUE)
+  ),
+  stringsAsFactors = FALSE
+)
+
+print_table_section(
+  "METHOD A - NEVER DIBAO: ANALYSIS SAMPLE",
+  never_model_summary
+)
+
+print_table_section(
+  "MAIN COX RESULTS: HR, 95% CI, AND P VALUE",
+  main_results_readable[
+    , c("comparison", "HR_95CI", "p_display"),
+    drop = FALSE
+  ]
+)
+
+cat("\nFull coxph model summary:\n")
+print(summary(main_fit))
+
+print_table_section(
+  "PROPORTIONAL HAZARDS (PH) DIAGNOSTIC",
+  main_ph_table
+)
+
+print_table_section(
+  "PH DIAGNOSTIC SOURCE",
+  ph_diagnostic_info
+)
+
+print_table_section(
+  "MARRIAGE UNKNOWN EXCLUSION QA",
+  marriage_unknown_exclusion_summary
+)
+
+print_table_section(
+  "HUKOU MISSING EXCLUSION QA",
+  hukou_missing_exclusion_summary
+)
+
+print_table_section(
+  "HUKOU PERSON-WAVE QA (SHARED COMMON DATA)",
+  hukou_qa
+)
+
+print_table_section(
+  "SEX x MARITAL STATUS CELL COUNTS",
+  sex_marriage_cell_qa
+)
+
+print_table_section(
+  "SEX x MARITAL STATUS LEVEL ELIGIBILITY",
+  sex_marriage_level_eligibility
+)
+
+print_table_section(
+  "SEX x MARITAL STATUS OVERALL INTERACTION",
+  sex_marriage_block
+)
+
+if (nrow(sex_marriage_level_HRs) > 0) {
+  print_table_section(
+    "SEX-SPECIFIC MARITAL-STATUS HRs",
+    sex_marriage_level_HRs
+  )
+}
+
+print_table_section(
+  "SPARSE-CELL QA (<5 EVENTS)",
+  sparse_qa
+)
+
+print_table_section(
+  "MODEL WARNINGS",
+  model_warning_table
+)
+
+# In RStudio / interactive R, automatically open the most useful tables.
+if (interactive()) {
+  View(
+    main_results_readable,
+    title = "Never Dibao - Main Cox Results"
+  )
+
+  View(
+    main_ph_table,
+    title = "Never Dibao - PH Diagnostic"
+  )
+
+  View(
+    sex_marriage_level_eligibility,
+    title = "Never Dibao - Sex x Marriage Eligibility"
+  )
+}
+
+cat("\n", paste(rep("=", 72), collapse = ""), "\n", sep = "")
+cat("Method A - Never Dibao Cox analysis completed successfully.\n")
+cat(
+  "Common RDS used: ",
+  COMMON_RDS,
+  "\n",
+  sep = ""
+)
+cat(
+  "Never results workbook: ",
+  file.path(OUTPUT_DIR, "A_Never_Dibao_Cox_results.xlsx"),
+  "\n",
+  sep = ""
+)
+cat(
+  "PH diagnostic source: ",
+  main_ph_diag$source,
+  "\n",
+  sep = ""
+)
+cat(
+  "Marriage Unknown intervals excluded from main Cox model: ",
+  nrow(marriage_unknown_excluded),
+  "\n",
+  sep = ""
+)
+cat(
+  "HUKOU-missing intervals excluded from main Cox model: ",
+  nrow(hukou_missing_excluded),
+  "\n",
+  sep = ""
+)
+cat(paste(rep("=", 72), collapse = ""), "\n", sep = "")
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
