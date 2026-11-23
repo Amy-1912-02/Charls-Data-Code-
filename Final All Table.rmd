@@ -1,0 +1,1863 @@
+---
+title: "Final Table"
+author: "Haoran Hao"
+date: "2026-11-19"
+output: html_document
+---
+
+#Figure_1_Model_A_Hukou_18cm.pdf
+#Figure_1_Model_A_Hukou_18cm.png
+```{r}
+# =====================================================================
+# Figure 1. Mortality Risk Factors by Dibao Status, China, 2011–2020
+# Revised independent Cox forest plot: 13 factors, including Hukou.
+# Output: 18 cm wide PDF and 300-dpi PNG; no Source/Note in the image.
+# =====================================================================
+
+# Install once if needed:
+# install.packages(c("readxl", "ggplot2"))
+
+library(readxl)
+library(ggplot2)
+
+# 1. Data folder -------------------------------------------------------
+data_dir <- "/Users/apple/Desktop/Bag/rolling/Postgraduate/ADV/Week 4/data"
+folders <- c(data_dir, file.path(data_dir, "A_Cox_outputs"))
+folders <- folders[dir.exists(folders)]
+if (length(folders) == 0) stop("Data folder does not exist: ", data_dir)
+
+# Match filenames without their parenthesized version numbers.
+# If more than one version exists, use the highest version number.
+find_excel <- function(stem) {
+  files <- unlist(lapply(folders, function(folder) {
+    list.files(folder, pattern = "\\.xlsx$", full.names = TRUE,
+               ignore.case = TRUE)
+  }), use.names = FALSE)
+  files <- unique(files[!grepl("^~\\$", basename(files))])
+
+  names_no_ext <- sub("\\.xlsx$", "", basename(files), ignore.case = TRUE)
+  names_clean <- trimws(gsub("[[:space:]]*[(（][^()（）]*[)）]$", "", names_no_ext))
+  candidates <- files[tolower(names_clean) == tolower(stem)]
+  if (length(candidates) == 0) stop("Excel file not found: ", stem)
+
+  # If a workbook was renamed without (1), (2), etc., prefer it.
+  plain <- candidates[tolower(basename(candidates)) ==
+                      tolower(paste0(stem, ".xlsx"))]
+  if (length(plain) == 1) {
+    chosen <- normalizePath(plain, mustWork = TRUE)
+    message("Using ", stem, ": ", basename(chosen))
+    return(chosen)
+  }
+
+  versions <- sub(".*[(（]([0-9]+)[)）]\\.xlsx$", "\\1",
+                  basename(candidates), ignore.case = TRUE)
+  versions <- suppressWarnings(as.integer(versions))
+  versions[is.na(versions)] <- 0L
+  selection <- order(versions, file.info(candidates)$mtime,
+                     decreasing = TRUE)[1]
+  chosen <- normalizePath(candidates[selection], mustWork = TRUE)
+  message("Using ", stem, ": ", basename(chosen))
+  chosen
+}
+
+ever_file  <- find_excel("A_Ever Dibao_Hukou")
+never_file <- find_excel("A_Never_Dibao_Hukou")
+
+# 2. Read exactly the 13 regression comparisons ------------------------
+read_cox <- function(file, group_name) {
+  if (!("Main_Cox_Readable" %in% excel_sheets(file))) {
+    stop("Missing Main_Cox_Readable worksheet: ", basename(file))
+  }
+  raw <- as.data.frame(read_excel(
+    file, sheet = "Main_Cox_Readable", range = "A1:I14"
+  ))
+  needed <- c("comparison", "HR", "lower_95", "upper_95", "p_value")
+  if (!all(needed %in% names(raw))) {
+    stop("Missing columns in ", basename(file), ": ",
+         paste(setdiff(needed, names(raw)), collapse = ", "))
+  }
+  dat <- raw[, needed, drop = FALSE]
+  dat$comparison <- trimws(as.character(dat$comparison))
+  if (nrow(dat) != 13 || anyNA(dat$comparison) ||
+      anyDuplicated(dat$comparison) > 0) {
+    stop("Expected 13 unique comparisons in ", basename(file))
+  }
+  for (col in c("HR", "lower_95", "upper_95", "p_value")) {
+    dat[[col]] <- suppressWarnings(as.numeric(dat[[col]]))
+  }
+  values <- as.matrix(dat[, c("HR", "lower_95", "upper_95", "p_value")])
+  if (any(!is.finite(values)) || any(dat$lower_95 <= 0) ||
+      any(dat$lower_95 > dat$HR) || any(dat$HR > dat$upper_95) ||
+      any(dat$p_value < 0 | dat$p_value > 1)) {
+    stop("Invalid HR, confidence interval or p-value in ", basename(file))
+  }
+  dat$group <- group_name
+  dat
+}
+
+never <- read_cox(never_file, "Never Dibao")
+ever  <- read_cox(ever_file, "Ever Dibao")
+
+# 3. Label groups, with reference categories ---------------------------
+groups <- list(
+  list(title = "SEX (ref: Male)",
+       names = "Female vs Male", labels = "Female"),
+  list(title = "INCOME (ref: T1)",
+       names = c("Income T2 vs T1", "Income T3 vs T1"),
+       labels = c("T2", "T3")),
+  list(title = "MARITAL STATUS (ref: Partnered)",
+       names = c("Widowed vs Partnered",
+                 "Separated/Divorced vs Partnered",
+                 "Never married vs Partnered"),
+       labels = c("Widowed", "Separated/Divorced", "Never married")),
+  list(title = "LIVING CHILDREN (ref: 0)",
+       names = c("1 living child vs 0", "2 living children vs 0",
+                 "3+ living children vs 0", "Living children Unknown vs 0"),
+       labels = c("1 child", "2 children", "3+ children", "Unknown")),
+  list(title = "CHILD CORESIDENCE (ref: No)",
+       names = c("Coresident child Yes vs No",
+                 "Coresident child Unknown vs No"),
+       labels = c("Yes", "Unknown")),
+  list(title = "HUKOU (ref: Non-agricultural)",
+       names = "Agricultural Hukou vs Non-agricultural Hukou",
+       labels = "Agricultural")
+)
+
+rows <- data.frame(type = character(), label = character(),
+                   comparison = character(), position = numeric(),
+                   stringsAsFactors = FALSE)
+position <- 0
+for (i in seq_along(groups)) {
+  g <- groups[[i]]
+  if (i > 1) position <- position + 0.55   # gap between categories
+  position <- position + 1.05
+  rows <- rbind(rows, data.frame(type = "heading", label = g$title,
+                                 comparison = NA_character_, position = position))
+  for (j in seq_along(g$names)) {
+    position <- position + 1.00
+    rows <- rbind(rows, data.frame(type = "factor", label = g$labels[j],
+                                   comparison = g$names[j], position = position))
+  }
+}
+rows$y <- max(rows$position) - rows$position + 1
+headings <- rows[rows$type == "heading", , drop = FALSE]
+factors  <- rows[rows$type == "factor", , drop = FALSE]
+
+# Stop rather than silently omit or mix any regression comparison.
+expected <- factors$comparison
+if (!setequal(never$comparison, expected) ||
+    !setequal(ever$comparison, expected)) {
+  stop("Factor names in the two Excel files do not match the figure labels.")
+}
+
+results <- rbind(never, ever)
+results$y <- factors$y[match(results$comparison, factors$comparison)]
+if (anyNA(results$y)) stop("A Cox estimate could not be aligned.")
+results$y_draw <- results$y +
+  ifelse(results$group == "Never Dibao", 0.20, -0.20)
+
+# 4. Axis layout and actual typography ---------------------------------
+font_family <- "Times New Roman"
+pt_to_mm <- function(pt) pt * 25.4 / 72
+body_pt <- 12
+heading_pt <- 13.5
+
+hr_min <- 0.2
+hr_max <- 5
+if (any(results$lower_95 < hr_min | results$upper_95 > hr_max)) {
+  stop("At least one CI is outside [0.2, 5]; update axis limits.")
+}
+
+# Plotting coordinates: logarithmic HR positions within the right panel.
+label_right <- 0.515
+axis_left   <- 0.550
+axis_right  <- 0.975
+x_hr <- function(hr) {
+  axis_left + (log(hr) - log(hr_min)) /
+    (log(hr_max) - log(hr_min)) * (axis_right - axis_left)
+}
+
+results$x    <- x_hr(results$HR)
+results$xlow <- x_hr(results$lower_95)
+results$xhigh <- x_hr(results$upper_95)
+
+ticks <- data.frame(hr = c(0.2, 0.5, 1, 2, 5))
+ticks$x <- x_hr(ticks$hr)
+
+axis_y <- min(factors$y) - 0.70
+plot_top <- max(headings$y) + 0.55
+
+colours <- c("Never Dibao" = "#253F67", "Ever Dibao" = "#B34E50")
+
+# 5. Draw the forest plot -----------------------------------------------
+figure1 <- ggplot() +
+  geom_segment(data = ticks,
+               aes(x = x, xend = x, y = axis_y + 0.1, yend = plot_top),
+               colour = "#E7EAF0", linewidth = 0.25) +
+  annotate("segment", x = x_hr(1), xend = x_hr(1),
+           y = axis_y + 0.1, yend = plot_top,
+           linetype = "dashed", colour = "#858585", linewidth = 0.55) +
+  geom_segment(data = results,
+               aes(x = xlow, xend = xhigh, y = y_draw, yend = y_draw,
+                   colour = group), linewidth = 0.82) +
+  geom_point(data = results,
+             aes(x = x, y = y_draw, colour = group), size = 2.9) +
+  geom_text(data = headings,
+            aes(x = label_right, y = y, label = label),
+            hjust = 1, family = font_family, fontface = "bold",
+            size = pt_to_mm(heading_pt), colour = "#253F67") +
+  geom_text(data = factors,
+            aes(x = label_right, y = y, label = label),
+            hjust = 1, family = font_family,
+            size = pt_to_mm(body_pt), colour = "#252525") +
+  annotate("segment", x = axis_left, xend = axis_right,
+           y = axis_y, yend = axis_y,
+           colour = "#333333", linewidth = 0.45) +
+  geom_segment(data = ticks,
+               aes(x = x, xend = x, y = axis_y, yend = axis_y - 0.14),
+               colour = "#333333", linewidth = 0.4) +
+  geom_text(data = ticks,
+            aes(x = x, y = axis_y - 0.39, label = as.character(hr)),
+            family = font_family, size = pt_to_mm(body_pt),
+            colour = "#252525") +
+  annotate("text", x = (axis_left + axis_right) / 2,
+           y = axis_y - 1.10, label = "Hazard ratio (log scale)",
+           family = font_family, size = pt_to_mm(body_pt),
+           colour = "#252525") +
+  scale_colour_manual(values = colours,
+                      breaks = c("Never Dibao", "Ever Dibao"), name = NULL) +
+  coord_cartesian(xlim = c(0, 1),
+                  ylim = c(axis_y - 1.70, plot_top + 0.1),
+                  expand = FALSE, clip = "off") +
+  labs(title = "Figure 1. Mortality Risk Factors by Dibao Status, China, 2011–2020") +
+  theme_void(base_size = 12, base_family = font_family) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 13.5,
+                              face = "bold", margin = margin(b = 5, unit = "pt")),
+    legend.position = "top",
+    legend.justification = "center",
+    legend.text = element_text(size = 12, family = font_family),
+    legend.key.width = grid::unit(0.95, "cm"),
+    legend.spacing.x = grid::unit(0.20, "cm"),
+    plot.margin = margin(4, 3, 3, 3, unit = "mm")
+  )
+
+print(figure1)
+
+# 6. Export at exactly 18 cm wide --------------------------------------
+output_stem <- file.path(data_dir, "Figure_1_Model_A_Hukou_18cm")
+
+if (isTRUE(capabilities("cairo"))) {
+  ggsave(paste0(output_stem, ".pdf"), plot = figure1,
+         device = grDevices::cairo_pdf,
+         width = 18, height = 20, units = "cm", bg = "white")
+} else {
+  ggsave(paste0(output_stem, ".pdf"), plot = figure1,
+         device = "pdf", width = 18, height = 20, units = "cm", bg = "white")
+}
+
+ggsave(paste0(output_stem, ".png"), plot = figure1,
+       width = 18, height = 20, units = "cm", dpi = 300, bg = "white")
+
+message("Figure 1 completed: 13 estimates per group (26 total).")
+message("PDF: ", paste0(output_stem, ".pdf"))
+message("PNG: ", paste0(output_stem, ".png"))
+```
+
+
+
+
+#Figure 2
+```{r}
+# ============================================================
+# Figure 2. Interaction Effects on Mortality Risk by Dibao Status, China, 2011–2020
+# Updated dual-panel forest plot using:
+#   A_Dibao_Interaction_Hukou.xlsx
+#   - Primary_Level_HRs
+#   - Primary_Block
+# Size: 18 x 18 cm
+# ============================================================
+
+# If needed, install once:
+# install.packages(c("readxl", "ggplot2"))
+
+library(readxl)
+library(ggplot2)
+
+# -------------------- 1. Data folder --------------------
+# Change this path only if your Excel file is stored elsewhere.
+data_dir <- "/Users/apple/Desktop/Bag/rolling/Postgraduate/ADV/Week 4/data"
+
+folders <- c(data_dir, file.path(data_dir, "A_Cox_outputs"))
+folders <- folders[dir.exists(folders)]
+
+if (length(folders) == 0) {
+  stop("Data folder does not exist: ", data_dir)
+}
+
+# -------------------- 2. Find Excel file --------------------
+# This function matches file names even if they contain trailing version numbers,
+# such as A_Dibao_Interaction_Hukou(2).xlsx or A_Dibao_Interaction_Hukou（2）.xlsx.
+
+find_excel <- function(stem) {
+
+  files <- unlist(lapply(folders, function(folder) {
+    list.files(
+      folder,
+      pattern = "\\.xlsx$",
+      full.names = TRUE,
+      ignore.case = TRUE
+    )
+  }), use.names = FALSE)
+
+  files <- unique(files[!grepl("^~\\$", basename(files))])
+
+  if (length(files) == 0) {
+    stop("No Excel files were found in the data folder.")
+  }
+
+  names_no_ext <- sub("\\.xlsx$", "", basename(files), ignore.case = TRUE)
+
+  names_clean <- trimws(gsub(
+    "[[:space:]]*[(（][^()（）]*[)）]$",
+    "",
+    names_no_ext
+  ))
+
+  candidates <- files[tolower(names_clean) == tolower(stem)]
+
+  if (length(candidates) == 0) {
+    stop("Excel file not found: ", stem)
+  }
+
+  plain <- candidates[
+    tolower(basename(candidates)) ==
+      tolower(paste0(stem, ".xlsx"))
+  ]
+
+  if (length(plain) == 1) {
+    chosen <- normalizePath(plain, mustWork = TRUE)
+    message("Using file: ", basename(chosen))
+    return(chosen)
+  }
+
+  versions <- sub(
+    ".*[(（]([0-9]+)[)）]$",
+    "\\1",
+    sub("\\.xlsx$", "", basename(candidates), ignore.case = TRUE),
+    ignore.case = TRUE
+  )
+
+  versions <- suppressWarnings(as.integer(versions))
+  versions[is.na(versions)] <- 0L
+
+  selection <- order(
+    versions,
+    file.info(candidates)$mtime,
+    decreasing = TRUE
+  )[1]
+
+  chosen <- normalizePath(candidates[selection], mustWork = TRUE)
+  message("Using file: ", basename(chosen))
+  chosen
+}
+
+input_file <- find_excel("A_Dibao_Interaction_Hukou")
+
+# -------------------- 3. Read and validate data --------------------
+all_sheets <- excel_sheets(input_file)
+
+if (!("Primary_Level_HRs" %in% all_sheets)) {
+  stop("Worksheet 'Primary_Level_HRs' is missing.")
+}
+if (!("Primary_Block" %in% all_sheets)) {
+  stop("Worksheet 'Primary_Block' is missing.")
+}
+
+level_df <- as.data.frame(read_excel(input_file, sheet = "Primary_Level_HRs"))
+block_df <- as.data.frame(read_excel(input_file, sheet = "Primary_Block"))
+
+need_level <- c(
+  "factor", "comparison",
+  "Never_HR", "Never_lower_95", "Never_upper_95",
+  "Ever_HR", "Ever_lower_95", "Ever_upper_95",
+  "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+  "interaction_p"
+)
+
+need_block <- c(
+  "analysis", "factor", "chisq", "df", "p_value", "n_interaction_terms", "status"
+)
+
+if (!all(need_level %in% names(level_df))) {
+  stop(
+    "Missing columns in Primary_Level_HRs: ",
+    paste(setdiff(need_level, names(level_df)), collapse = ", ")
+  )
+}
+
+if (!all(need_block %in% names(block_df))) {
+  stop(
+    "Missing columns in Primary_Block: ",
+    paste(setdiff(need_block, names(block_df)), collapse = ", ")
+  )
+}
+
+level_df <- level_df[, need_level, drop = FALSE]
+block_df <- block_df[, need_block, drop = FALSE]
+
+# Convert numeric columns
+num_cols <- c(
+  "Never_HR", "Never_lower_95", "Never_upper_95",
+  "Ever_HR", "Ever_lower_95", "Ever_upper_95",
+  "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+  "interaction_p"
+)
+
+for (nm in num_cols) {
+  level_df[[nm]] <- suppressWarnings(as.numeric(level_df[[nm]]))
+}
+
+block_num <- c("chisq", "df", "p_value", "n_interaction_terms")
+for (nm in block_num) {
+  block_df[[nm]] <- suppressWarnings(as.numeric(block_df[[nm]]))
+}
+
+level_df$comparison <- trimws(as.character(level_df$comparison))
+level_df$factor <- trimws(as.character(level_df$factor))
+block_df$factor <- trimws(as.character(block_df$factor))
+
+if (nrow(level_df) != 11) {
+  stop("Primary_Level_HRs should contain exactly 11 rows.")
+}
+
+if (anyDuplicated(level_df$comparison) > 0) {
+  stop("Duplicate comparison names found in Primary_Level_HRs.")
+}
+
+if (any(!is.finite(as.matrix(level_df[, num_cols])))) {
+  stop("Primary_Level_HRs contains missing or invalid numeric values.")
+}
+
+if (any(level_df$Never_lower_95 <= 0 |
+        level_df$Never_lower_95 > level_df$Never_HR |
+        level_df$Never_HR > level_df$Never_upper_95)) {
+  stop("Invalid Never HR confidence interval values.")
+}
+
+if (any(level_df$Ever_lower_95 <= 0 |
+        level_df$Ever_lower_95 > level_df$Ever_HR |
+        level_df$Ever_HR > level_df$Ever_upper_95)) {
+  stop("Invalid Ever HR confidence interval values.")
+}
+
+if (any(level_df$ratio_lower_95 <= 0 |
+        level_df$ratio_lower_95 > level_df$HR_ratio_Ever_vs_Never |
+        level_df$HR_ratio_Ever_vs_Never > level_df$ratio_upper_95)) {
+  stop("Invalid interaction HR ratio confidence interval values.")
+}
+
+if (any(level_df$interaction_p < 0 | level_df$interaction_p > 1)) {
+  stop("Invalid interaction p-values.")
+}
+
+# -------------------- 4. Define display order and labels --------------------
+layout_info <- data.frame(
+  group_title = c(
+    "SEX (ref: Male)",
+    "INCOME (ref: T1)",
+    "INCOME (ref: T1)",
+    "MARITAL STATUS (ref: Partnered)",
+    "MARITAL STATUS (ref: Partnered)",
+    "MARITAL STATUS (ref: Partnered)",
+    "LIVING CHILDREN (ref: 0)",
+    "LIVING CHILDREN (ref: 0)",
+    "LIVING CHILDREN (ref: 0)",
+    "CHILD CORESIDENCE (ref: No)",
+    "HUKOU (ref: Non-agricultural)"
+  ),
+  comparison = c(
+    "Sex: Female vs Male",
+    "Income: T2 vs T1",
+    "Income: T3 vs T1",
+    "Marriage: Widowed vs Partnered",
+    "Marriage: Separated-Divorced vs Partnered",
+    "Marriage: Never married vs Partnered",
+    "Living children: 1 vs 0",
+    "Living children: 2 vs 0",
+    "Living children: 3+ vs 0",
+    "Coresident child: Yes vs No",
+    "HUKOU: Agricultural vs Non-agricultural"
+  ),
+  row_label = c(
+    "Female",
+    "T2", "T3",
+    "Widowed", "Separated/Divorced", "Never married",
+    "1 child", "2 children", "3+ children",
+    "Yes",
+    "Agricultural"
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (!setequal(layout_info$comparison, level_df$comparison)) {
+  stop("The comparisons in the Excel file do not match the expected 11 Figure 2 comparisons.")
+}
+
+# Build rows with headings + factors
+rows <- data.frame(
+  type = character(),
+  label = character(),
+  comparison = character(),
+  position = numeric(),
+  stringsAsFactors = FALSE
+)
+
+current_pos <- 0
+unique_groups <- unique(layout_info$group_title)
+
+for (i in seq_along(unique_groups)) {
+  g <- unique_groups[i]
+
+  if (i > 1) {
+    current_pos <- current_pos + 0.55
+  }
+
+  current_pos <- current_pos + 1.00
+
+  rows <- rbind(
+    rows,
+    data.frame(
+      type = "heading",
+      label = g,
+      comparison = NA_character_,
+      position = current_pos,
+      stringsAsFactors = FALSE
+    )
+  )
+
+  sub <- layout_info[layout_info$group_title == g, , drop = FALSE]
+
+  for (j in seq_len(nrow(sub))) {
+    current_pos <- current_pos + 0.95
+
+    rows <- rbind(
+      rows,
+      data.frame(
+        type = "factor",
+        label = sub$row_label[j],
+        comparison = sub$comparison[j],
+        position = current_pos,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+rows$y <- max(rows$position) - rows$position + 1
+
+headings <- rows[rows$type == "heading", , drop = FALSE]
+factors  <- rows[rows$type == "factor",  , drop = FALSE]
+
+# -------------------- 5. Merge plotting data --------------------
+df <- merge(level_df, factors[, c("comparison", "y")], by = "comparison", all.x = TRUE, sort = FALSE)
+
+if (anyNA(df$y)) {
+  stop("Some rows could not be aligned to the figure layout.")
+}
+
+# Build left-panel long data: Never / Ever
+left_never <- data.frame(
+  comparison = df$comparison,
+  y = df$y + 0.16,
+  group = "Never",
+  hr = df$Never_HR,
+  low = df$Never_lower_95,
+  high = df$Never_upper_95,
+  stringsAsFactors = FALSE
+)
+
+left_ever <- data.frame(
+  comparison = df$comparison,
+  y = df$y - 0.16,
+  group = "Ever",
+  hr = df$Ever_HR,
+  low = df$Ever_lower_95,
+  high = df$Ever_upper_95,
+  stringsAsFactors = FALSE
+)
+
+left_plot <- rbind(left_never, left_ever)
+
+# Build right-panel data: interaction HR ratio
+right_plot <- data.frame(
+  comparison = df$comparison,
+  y = df$y,
+  hr = df$HR_ratio_Ever_vs_Never,
+  low = df$ratio_lower_95,
+  high = df$ratio_upper_95,
+  interaction_p = df$interaction_p,
+  sig_group = ifelse(df$interaction_p < 0.05, "p < 0.05", "p >= 0.05"),
+  stringsAsFactors = FALSE
+)
+
+# -------------------- 6. Axis settings --------------------
+# Left panel: group-specific HRs
+left_min <- 0.3
+left_max <- 4.0
+left_ticks <- c(0.5, 1, 2, 4)
+
+# Right panel: interaction HR ratios
+right_min <- 0.2
+right_max <- 3.0
+right_ticks <- c(0.2, 0.5, 1, 2)
+
+if (any(left_plot$low < left_min | left_plot$high > left_max)) {
+  stop("At least one group-specific HR CI falls outside the planned left-axis range.")
+}
+
+if (any(right_plot$low < right_min | right_plot$high > right_max)) {
+  stop("At least one interaction HR ratio CI falls outside the planned right-axis range.")
+}
+
+# Overall canvas coordinates
+label_x      <- 0.42
+left_x0      <- 0.49
+left_x1      <- 0.69
+right_x0     <- 0.75
+right_x1     <- 0.96
+
+top_y        <- max(headings$y) + 1.75
+axis_y       <- min(factors$y) - 0.65
+plot_top_y   <- max(headings$y) + 0.15
+
+map_left <- function(x) {
+  left_x0 + (log(x) - log(left_min)) / (log(left_max) - log(left_min)) * (left_x1 - left_x0)
+}
+
+map_right <- function(x) {
+  right_x0 + (log(x) - log(right_min)) / (log(right_max) - log(right_min)) * (right_x1 - right_x0)
+}
+
+left_plot$x    <- map_left(left_plot$hr)
+left_plot$xlow <- map_left(left_plot$low)
+left_plot$xhigh<- map_left(left_plot$high)
+
+right_plot$x    <- map_right(right_plot$hr)
+right_plot$xlow <- map_right(right_plot$low)
+right_plot$xhigh<- map_right(right_plot$high)
+
+left_tick_df <- data.frame(
+  tick = left_ticks,
+  x = map_left(left_ticks)
+)
+
+right_tick_df <- data.frame(
+  tick = right_ticks,
+  x = map_right(right_ticks)
+)
+
+# -------------------- 7. Appearance settings --------------------
+font_family <- "Times New Roman"
+
+pt_to_mm <- function(pt) {
+  pt * 25.4 / 72
+}
+
+# Text sizes
+title_pt       <- 13.5
+panel_title_pt <- 12.5
+body_pt        <- 12
+heading_pt     <- 13.5
+legend_pt      <- 11
+
+# Colours
+col_never  <- "#253F67"
+col_ever   <- "#B34E50"
+col_red    <- "#B34E50"
+col_blue   <- "#253F67"
+grid_col   <- "#E7EAF0"
+refline_col<- "#878787"
+text_col   <- "#252525"
+
+# -------------------- 8. Manual legend coordinates --------------------
+left_center  <- (left_x0 + left_x1) / 2
+right_center <- (right_x0 + right_x1) / 2
+
+# Separate panel headings from legend rows (18 x 18 cm layout).
+# The original 0.32-unit gap was too small for 12.5/11-pt text.
+panel_title_y <- top_y + 0.65
+legend_y      <- top_y - 0.50
+
+# Left legend positions
+leg_left_never_x <- left_center - 0.055
+leg_left_ever_x  <- left_center + 0.055
+
+# Right legend positions
+leg_right_blue_x <- right_center - 0.060
+leg_right_red_x  <- right_center + 0.060
+
+# -------------------- 9. Draw plot --------------------
+fig2 <- ggplot() +
+
+  # Panel titles
+  annotate(
+    "text",
+    x = left_center,
+    y = panel_title_y,
+    label = "Group-specific HRs",
+    family = font_family,
+    fontface = "bold",
+    size = pt_to_mm(panel_title_pt),
+    hjust = 0.5,
+    colour = text_col
+  ) +
+  annotate(
+    "text",
+    x = right_center,
+    y = panel_title_y,
+    label = "Interaction HR ratio",
+    family = font_family,
+    fontface = "bold",
+    size = pt_to_mm(panel_title_pt),
+    hjust = 0.5,
+    colour = text_col
+  ) +
+
+  # ---------------- Left legend ----------------
+  annotate(
+    "segment",
+    x = leg_left_never_x - 0.015, xend = leg_left_never_x + 0.015,
+    y = legend_y, yend = legend_y,
+    colour = col_never, linewidth = 0.8
+  ) +
+  annotate(
+    "point",
+    x = leg_left_never_x, y = legend_y,
+    colour = col_never, size = 2.7
+  ) +
+  annotate(
+    "text",
+    x = leg_left_never_x + 0.025, y = legend_y,
+    label = "Never",
+    family = font_family,
+    size = pt_to_mm(legend_pt),
+    hjust = 0,
+    vjust = 0.5,
+    colour = text_col
+  ) +
+
+  annotate(
+    "segment",
+    x = leg_left_ever_x - 0.015, xend = leg_left_ever_x + 0.015,
+    y = legend_y, yend = legend_y,
+    colour = col_ever, linewidth = 0.8
+  ) +
+  annotate(
+    "point",
+    x = leg_left_ever_x, y = legend_y,
+    colour = col_ever, size = 2.7
+  ) +
+  annotate(
+    "text",
+    x = leg_left_ever_x + 0.025, y = legend_y,
+    label = "Ever",
+    family = font_family,
+    size = pt_to_mm(legend_pt),
+    hjust = 0,
+    vjust = 0.5,
+    colour = text_col
+  ) +
+
+  # ---------------- Right legend ----------------
+  annotate(
+    "segment",
+    x = leg_right_blue_x - 0.015, xend = leg_right_blue_x + 0.015,
+    y = legend_y, yend = legend_y,
+    colour = col_blue, linewidth = 0.8
+  ) +
+  annotate(
+    "point",
+    x = leg_right_blue_x, y = legend_y,
+    colour = col_blue, size = 2.7
+  ) +
+  annotate(
+    "text",
+    x = leg_right_blue_x + 0.025, y = legend_y,
+    label = "p >= 0.05",
+    family = font_family,
+    size = pt_to_mm(legend_pt),
+    hjust = 0,
+    vjust = 0.5,
+    colour = text_col
+  ) +
+
+  annotate(
+    "segment",
+    x = leg_right_red_x - 0.015, xend = leg_right_red_x + 0.015,
+    y = legend_y, yend = legend_y,
+    colour = col_red, linewidth = 0.8
+  ) +
+  annotate(
+    "point",
+    x = leg_right_red_x, y = legend_y,
+    colour = col_red, size = 2.7
+  ) +
+  annotate(
+    "text",
+    x = leg_right_red_x + 0.025, y = legend_y,
+    label = "p < 0.05",
+    family = font_family,
+    size = pt_to_mm(legend_pt),
+    hjust = 0,
+    vjust = 0.5,
+    colour = text_col
+  ) +
+
+  # ---------------- Grid lines: left panel ----------------
+  geom_segment(
+    data = left_tick_df,
+    aes(x = x, xend = x, y = axis_y + 0.12, yend = plot_top_y),
+    colour = grid_col,
+    linewidth = 0.25
+  ) +
+
+  # Left HR = 1 dashed line
+  annotate(
+    "segment",
+    x = map_left(1), xend = map_left(1),
+    y = axis_y + 0.12, yend = plot_top_y,
+    linetype = "dashed",
+    colour = refline_col,
+    linewidth = 0.55
+  ) +
+
+  # ---------------- Grid lines: right panel ----------------
+  geom_segment(
+    data = right_tick_df,
+    aes(x = x, xend = x, y = axis_y + 0.12, yend = plot_top_y),
+    colour = grid_col,
+    linewidth = 0.25
+  ) +
+
+  # Right HR ratio = 1 dashed line
+  annotate(
+    "segment",
+    x = map_right(1), xend = map_right(1),
+    y = axis_y + 0.12, yend = plot_top_y,
+    linetype = "dashed",
+    colour = refline_col,
+    linewidth = 0.55
+  ) +
+
+  # ---------------- Left panel: CI lines ----------------
+  geom_segment(
+    data = subset(left_plot, group == "Never"),
+    aes(x = xlow, xend = xhigh, y = y, yend = y),
+    colour = col_never,
+    linewidth = 0.82
+  ) +
+  geom_segment(
+    data = subset(left_plot, group == "Ever"),
+    aes(x = xlow, xend = xhigh, y = y, yend = y),
+    colour = col_ever,
+    linewidth = 0.82
+  ) +
+
+  # Left panel: points
+  geom_point(
+    data = subset(left_plot, group == "Never"),
+    aes(x = x, y = y),
+    colour = col_never,
+    size = 2.8
+  ) +
+  geom_point(
+    data = subset(left_plot, group == "Ever"),
+    aes(x = x, y = y),
+    colour = col_ever,
+    size = 2.8
+  ) +
+
+  # ---------------- Right panel: CI lines ----------------
+  geom_segment(
+    data = subset(right_plot, sig_group == "p >= 0.05"),
+    aes(x = xlow, xend = xhigh, y = y, yend = y),
+    colour = col_blue,
+    linewidth = 0.82
+  ) +
+  geom_segment(
+    data = subset(right_plot, sig_group == "p < 0.05"),
+    aes(x = xlow, xend = xhigh, y = y, yend = y),
+    colour = col_red,
+    linewidth = 0.82
+  ) +
+
+  # Right panel: points
+  geom_point(
+    data = subset(right_plot, sig_group == "p >= 0.05"),
+    aes(x = x, y = y),
+    colour = col_blue,
+    size = 2.8
+  ) +
+  geom_point(
+    data = subset(right_plot, sig_group == "p < 0.05"),
+    aes(x = x, y = y),
+    colour = col_red,
+    size = 2.8
+  ) +
+
+  # ---------------- Left-side group headings ----------------
+  geom_text(
+    data = headings,
+    aes(x = label_x, y = y, label = label),
+    family = font_family,
+    fontface = "bold",
+    size = pt_to_mm(heading_pt),
+    hjust = 1,
+    colour = col_never
+  ) +
+
+  # ---------------- Left-side factor labels ----------------
+  geom_text(
+    data = factors,
+    aes(x = label_x, y = y, label = label),
+    family = font_family,
+    size = pt_to_mm(body_pt),
+    hjust = 1,
+    colour = text_col
+  ) +
+
+  # ---------------- Left axis line and ticks ----------------
+  annotate(
+    "segment",
+    x = left_x0, xend = left_x1,
+    y = axis_y, yend = axis_y,
+    colour = "#333333",
+    linewidth = 0.45
+  ) +
+  geom_segment(
+    data = left_tick_df,
+    aes(x = x, xend = x, y = axis_y, yend = axis_y - 0.14),
+    colour = "#333333",
+    linewidth = 0.40
+  ) +
+  geom_text(
+    data = left_tick_df,
+    aes(x = x, y = axis_y - 0.40, label = tick),
+    family = font_family,
+    size = pt_to_mm(body_pt),
+    colour = text_col
+  ) +
+  annotate(
+    "text",
+    x = (left_x0 + left_x1) / 2,
+    y = axis_y - 1.05,
+    label = "Hazard ratio (log scale)",
+    family = font_family,
+    size = pt_to_mm(body_pt),
+    colour = text_col
+  ) +
+
+  # ---------------- Right axis line and ticks ----------------
+  annotate(
+    "segment",
+    x = right_x0, xend = right_x1,
+    y = axis_y, yend = axis_y,
+    colour = "#333333",
+    linewidth = 0.45
+  ) +
+  geom_segment(
+    data = right_tick_df,
+    aes(x = x, xend = x, y = axis_y, yend = axis_y - 0.14),
+    colour = "#333333",
+    linewidth = 0.40
+  ) +
+  geom_text(
+    data = right_tick_df,
+    aes(x = x, y = axis_y - 0.40, label = tick),
+    family = font_family,
+    size = pt_to_mm(body_pt),
+    colour = text_col
+  ) +
+  annotate(
+    "text",
+    x = (right_x0 + right_x1) / 2,
+    y = axis_y - 1.05,
+    label = "HR ratio (log scale)",
+    family = font_family,
+    size = pt_to_mm(body_pt),
+    colour = text_col
+  ) +
+
+  coord_cartesian(
+    xlim = c(0, 1),
+    ylim = c(axis_y - 1.45, top_y + 1.35),
+    expand = FALSE,
+    clip = "off"
+  ) +
+
+  theme_void(base_family = font_family) +
+  theme(
+    plot.margin = margin(4, 4, 4, 4, unit = "mm")
+  )
+
+# -------------------- 10. Display --------------------
+print(fig2)
+
+# -------------------- 11. Save output --------------------
+output_stem <- file.path(data_dir, "Figure_2_Model_A_Hukou_18cm")
+
+if (isTRUE(capabilities("cairo"))) {
+  ggsave(
+    paste0(output_stem, ".pdf"),
+    plot = fig2,
+    device = cairo_pdf,
+    width = 18,
+    height = 18,
+    units = "cm",
+    bg = "white"
+  )
+} else {
+  ggsave(
+    paste0(output_stem, ".pdf"),
+    plot = fig2,
+    device = "pdf",
+    width = 18,
+    height = 18,
+    units = "cm",
+    bg = "white"
+  )
+}
+
+ggsave(
+  paste0(output_stem, ".png"),
+  plot = fig2,
+  width = 18,
+  height = 18,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+message("Figure 2 completed successfully.")
+message("PDF saved to: ", paste0(output_stem, ".pdf"))
+message("PNG saved to: ", paste0(output_stem, ".png"))
+```
+
+
+
+
+
+
+#Model B1-1/2/3/4
+```{r}
+# ============================================================================
+# Figure 4. Cox forest plot: B1-1, B1-2, B1-3 and B1-4 (one horizontal row)
+# Shared factor labels appear ONCE at the far left, including ADL and IADL.
+# Each panel retains its own HRs, 95% CIs and log-scaled HR axis.
+# Source: Model B1 Ever/Never workbooks, worksheet Full_Cox_Results.
+# Output: 30.3 x 18 cm PDF and 300-dpi PNG; no Source/Note printed in figure.
+# ============================================================================
+
+# Install only once if needed: install.packages(c("readxl", "ggplot2"))
+library(readxl)
+library(ggplot2)
+
+# 1. Locate the two source workbooks -----------------------------------------
+data_dir <- "/Users/apple/Desktop/Bag/rolling/Postgraduate/ADV/Week 4/data"
+search_dirs <- c(data_dir, file.path(data_dir, "A_Cox_outputs"), getwd())
+search_dirs <- unique(search_dirs[dir.exists(search_dirs)])
+
+find_excel <- function(stem, version) {
+  files <- unlist(lapply(search_dirs, function(folder) {
+    list.files(folder, pattern = "\\.xlsx$", full.names = TRUE,
+               ignore.case = TRUE)
+  }), use.names = FALSE)
+  files <- unique(files[!grepl("^~\\$", basename(files))])
+  names_without_ext <- sub("\\.xlsx$", "", basename(files), ignore.case = TRUE)
+  clean_names <- trimws(sub("[[:space:]]*[(（][0-9]+[)）]$", "", names_without_ext))
+  matches <- files[tolower(clean_names) == tolower(stem)]
+  if (length(matches) == 0) stop("Workbook not found: ", stem)
+
+  # Prefer the filename with no parenthesised suffix; otherwise use the
+  # specific latest version supplied for this analysis.
+  plain <- matches[tolower(basename(matches)) ==
+                     tolower(paste0(stem, ".xlsx"))]
+  numbered <- matches[grepl(paste0("[(（]", version, "[)）]\\.xlsx$"),
+                            basename(matches))]
+  if (length(plain) == 1) {
+    path <- plain[1]
+  } else if (length(numbered) == 1) {
+    path <- numbered[1]
+  } else if (length(matches) == 1) {
+    path <- matches[1]
+  } else {
+    stop("Multiple versions found for ", stem,
+         ". Rename the intended workbook without its version suffix.")
+  }
+  path <- normalizePath(path, mustWork = TRUE)
+  message("Reading: ", path)
+  path
+}
+
+ever_file <- find_excel("Model B1_Ever_ADL_IADL_Cox_results", 3)
+never_file <- find_excel("Model B1_Never_ADL_IADL_Cox_results", 2)
+
+# 2. Exact model and factor definitions -------------------------------------
+models <- c("Common_M1", "M2_ADL", "M3_IADL", "M4_ADL_IADL")
+panel_names <- c("B1-1", "B1-2", "B1-3", "B1-4")
+panel_subtitles <- c("Original covariates", "+ ADL", "+ IADL", "+ ADL and IADL")
+
+terms <- c(
+  "sexFemale", "income_tertileT2", "income_tertileT3",
+  "marriage_statusWidowed", "marriage_statusSeparated-Divorced",
+  "marriage_statusNever married", "living_children1", "living_children2",
+  "living_children3+", "living_childrenUnknown",
+  "coresident_childYes", "coresident_childUnknown",
+  "hukouAgricultural", "adl", "iadl"
+)
+expected <- list(
+  Common_M1  = terms[1:13],
+  M2_ADL     = terms[c(1:13, 14)],
+  M3_IADL    = terms[c(1:13, 15)],
+  M4_ADL_IADL = terms
+)
+
+# 3. Read and validate 56 estimates per Dibao group --------------------------
+read_group <- function(file, group_name) {
+  if (!"Full_Cox_Results" %in% excel_sheets(file)) {
+    stop("Missing Full_Cox_Results worksheet: ", basename(file))
+  }
+  # The source workbook has incorrect A1 worksheet-dimension metadata.
+  # The real populated area is A1:I70; specify the range explicitly.
+  raw <- as.data.frame(read_excel(file, sheet = "Full_Cox_Results",
+                                  range = "A1:I70"))
+  required <- c("Model", "term", "beta", "HR", "lower_95",
+                "upper_95", "p_value")
+  if (!all(required %in% names(raw))) {
+    stop("Missing columns in ", basename(file), ": ",
+         paste(setdiff(required, names(raw)), collapse = ", "))
+  }
+  raw$Model <- trimws(as.character(raw$Model))
+  dat <- raw[raw$Model %in% models, required, drop = FALSE]
+  dat$term <- trimws(as.character(dat$term))
+  for (nm in c("beta", "HR", "lower_95", "upper_95", "p_value")) {
+    dat[[nm]] <- suppressWarnings(as.numeric(dat[[nm]]))
+  }
+
+  if (nrow(dat) != 56 || anyNA(dat$term) ||
+      anyDuplicated(paste(dat$Model, dat$term)) > 0) {
+    stop(group_name, ": expected 56 distinct model/factor estimates")
+  }
+  for (model in models) {
+    if (!setequal(dat$term[dat$Model == model], expected[[model]])) {
+      stop(group_name, ": unexpected factors in ", model)
+    }
+  }
+  numerical <- as.matrix(dat[, c("beta", "HR", "lower_95",
+                                 "upper_95", "p_value")])
+  if (any(!is.finite(numerical)) ||
+      any(dat$lower_95 <= 0 | dat$lower_95 > dat$HR |
+          dat$HR > dat$upper_95) ||
+      any(dat$p_value < 0 | dat$p_value > 1) ||
+      any(abs(exp(dat$beta) - dat$HR) > 1e-5)) {
+    stop(group_name, ": invalid beta, HR, confidence interval or p-value")
+  }
+  dat$group <- group_name
+  dat
+}
+
+results <- rbind(
+  read_group(never_file, "Never Dibao"),
+  read_group(ever_file, "Ever Dibao")
+)
+stopifnot(nrow(results) == 112)
+
+# 4. ONE shared factor-label column -----------------------------------------
+section_titles <- c(
+  "SEX (ref: Male)", "INCOME (ref: T1)",
+  "MARITAL STATUS (ref: Partnered)", "LIVING CHILDREN (ref: 0)",
+  "CHILD CORESIDENCE (ref: No)",
+  "HUKOU (ref: Non-agricultural)", "FUNCTIONAL HEALTH"
+)
+factor_labels <- c(
+  "Female", "T2", "T3", "Widowed", "Separated/Divorced",
+  "Never married", "1 child", "2 children", "3+ children", "Unknown",
+  "Yes", "Unknown", "Agricultural", "ADL", "IADL"
+)
+section_id <- c(1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 6, 7, 7)
+
+# The same y positions are used by all four forest plots.
+row_list <- list()
+pos <- 0
+for (section in seq_along(section_titles)) {
+  if (section > 1) pos <- pos + 1.10
+  row_list[[length(row_list) + 1]] <- data.frame(
+    type = "heading", term = "", label = section_titles[section], offset = pos
+  )
+  for (j in which(section_id == section)) {
+    pos <- pos + 1.05
+    row_list[[length(row_list) + 1]] <- data.frame(
+      type = "factor", term = terms[j], label = factor_labels[j], offset = pos
+    )
+  }
+}
+rows <- do.call(rbind, row_list)
+stopifnot(identical(rows$term[rows$type == "factor"], terms))
+
+plot_top <- 26.2
+rows$y <- plot_top - rows$offset
+headings <- rows[rows$type == "heading", , drop = FALSE]
+labels <- rows[rows$type == "factor", , drop = FALSE]
+# ADL and IADL are written here ONCE at the bottom of the common label column.
+# B1-1 has no functional-health estimates, B1-2 adds ADL, B1-3 IADL,
+# and B1-4 both; absent estimates simply have no plotted point.
+
+# 5. Four adjacent HR panels, WITHOUT repeated factor labels -----------------
+# One shared label column is followed by four equally sized HR panels.
+forest_starts <- c(7.85, 13.35, 18.85, 24.35)
+forest_width <- 4.78
+panels <- data.frame(
+  Model = models,
+  name = panel_names,
+  subtitle = panel_subtitles,
+  xmin = forest_starts,
+  xmax = forest_starts + forest_width,
+  stringsAsFactors = FALSE
+)
+panels$xmid <- (panels$xmin + panels$xmax) / 2
+
+results$panel_index <- match(results$Model, panels$Model)
+results$label_index <- match(results$term, labels$term)
+if (anyNA(results$panel_index) || anyNA(results$label_index)) {
+  stop("Model/factor alignment failed")
+}
+results$y <- labels$y[results$label_index]
+results$y_draw <- results$y +
+  ifelse(results$group == "Never Dibao", 0.20, -0.20)
+
+# 6. Shared logarithmic HR axis on ALL panels -------------------------------
+hr_limits <- c(0.15, 5.5)
+if (any(results$lower_95 < hr_limits[1] |
+        results$upper_95 > hr_limits[2])) {
+  stop("At least one 95% CI falls outside the HR plotting range")
+}
+map_hr <- function(hr, xmin) {
+  xmin + (log(hr) - log(hr_limits[1])) /
+    (log(hr_limits[2]) - log(hr_limits[1])) * forest_width
+}
+start_x <- panels$xmin[results$panel_index]
+results$x <- map_hr(results$HR, start_x)
+results$lo <- map_hr(results$lower_95, start_x)
+results$hi <- map_hr(results$upper_95, start_x)
+
+axis_y <- min(rows$y) - 0.65
+ticks <- c(0.2, 0.5, 1, 2, 5)
+tick_df <- do.call(rbind, lapply(seq_len(nrow(panels)), function(i) {
+  data.frame(x = map_hr(ticks, panels$xmin[i]),
+             label = as.character(ticks), ymin = axis_y,
+             ymax = plot_top + 0.10)
+}))
+refs <- data.frame(x = map_hr(1, panels$xmin), ymin = axis_y,
+                   ymax = plot_top + 0.10)
+
+# 7. Colours, typeface and legend -------------------------------------------
+font_family <- "Times New Roman"
+pt_to_mm <- function(pt) pt * 25.4 / 72
+navy <- "#253F67"
+red <- "#B34E50"
+colour_values <- c("Never Dibao" = navy, "Ever Dibao" = red)
+shape_values <- c("Never Dibao" = 16, "Ever Dibao" = 15)
+ordinary <- results[!results$term %in% c("adl", "iadl"), , drop = FALSE]
+functional <- results[results$term %in% c("adl", "iadl"), , drop = FALSE]
+legend <- data.frame(group = c("Never Dibao", "Ever Dibao"),
+                     x = c(12.15, 17.35), y = c(31.6, 31.6))
+
+# 8. Plot ---------------------------------------------------------------
+fig4 <- ggplot() +
+  geom_segment(data = tick_df,
+               aes(x = x, xend = x, y = ymin, yend = ymax),
+               colour = "#E7EAF0", linewidth = 0.25) +
+  geom_segment(data = refs,
+               aes(x = x, xend = x, y = ymin, yend = ymax),
+               linetype = "dashed", colour = "#858585", linewidth = 0.55) +
+  geom_segment(data = results,
+               aes(x = lo, xend = hi, y = y_draw, yend = y_draw,
+                   colour = group), linewidth = 0.65) +
+  geom_segment(data = results,
+               aes(x = lo, xend = lo, y = y_draw - 0.12,
+                   yend = y_draw + 0.12, colour = group), linewidth = 0.48) +
+  geom_segment(data = results,
+               aes(x = hi, xend = hi, y = y_draw - 0.12,
+                   yend = y_draw + 0.12, colour = group), linewidth = 0.48) +
+  geom_point(data = ordinary,
+             aes(x = x, y = y_draw, colour = group, shape = group), size = 2.1) +
+  geom_point(data = functional,
+             aes(x = x, y = y_draw, colour = group, shape = group), size = 1.05) +
+
+  # Shared text: precisely ONE occurrence of each category and factor label.
+  geom_text(data = headings,
+            aes(x = 0.18, y = y, label = label),
+            hjust = 0, family = font_family, fontface = "bold",
+            size = pt_to_mm(12), colour = navy) +
+  geom_text(data = labels,
+            aes(x = 7.53, y = y, label = label),
+            hjust = 1, family = font_family,
+            size = pt_to_mm(11), colour = "#252525") +
+
+  # Individual axes remain under each HR panel.
+  geom_segment(data = panels,
+               aes(x = xmin, xend = xmax, y = axis_y, yend = axis_y),
+               linewidth = 0.45, colour = "#333333") +
+  geom_segment(data = tick_df,
+               aes(x = x, xend = x, y = ymin, yend = ymin - 0.13),
+               linewidth = 0.40, colour = "#333333") +
+  geom_text(data = tick_df,
+            aes(x = x, y = ymin - 0.43, label = label),
+            family = font_family, size = pt_to_mm(11),
+            colour = "#252525") +
+  geom_text(data = panels,
+            aes(x = xmid, y = axis_y - 1.20),
+            label = "Hazard ratio (log scale)",
+            family = font_family, size = pt_to_mm(11),
+            colour = "#252525") +
+
+  # Revised panel names and retained adjustment subtitles.
+  geom_text(data = panels,
+            aes(x = xmid, y = plot_top + 2.35, label = name),
+            family = font_family, size = pt_to_mm(13), fontface = "bold") +
+  geom_text(data = panels,
+            aes(x = xmid, y = plot_top + 1.35, label = subtitle),
+            family = font_family, size = pt_to_mm(11),
+            colour = "#5A5A5A") +
+
+  # ONE Never/Ever colour legend above all four panels.
+  geom_segment(data = legend,
+               aes(x = x - 0.40, xend = x + 0.15,
+                   y = y, yend = y, colour = group), linewidth = 0.8) +
+  geom_point(data = legend,
+             aes(x = x - 0.12, y = y, colour = group, shape = group),
+             size = 2.3) +
+  geom_text(data = legend,
+            aes(x = x + 0.28, y = y, label = group),
+            family = font_family, hjust = 0, size = pt_to_mm(11)) +
+
+  # Complete figure title; no Source/Note inside the image.
+  annotate("text", x = 15.15, y = 34.20,
+           label = paste0(
+             "Figure 4. Mortality Risk Factors by Dibao Status Across",
+             "\nADL and IADL Model Specifications, China, 2011–2020"
+           ),
+           family = font_family, fontface = "bold",
+           size = pt_to_mm(13), lineheight = 1.06, hjust = 0.5) +
+  scale_colour_manual(values = colour_values, guide = "none") +
+  scale_shape_manual(values = shape_values, guide = "none") +
+  coord_cartesian(xlim = c(0, 30.3), ylim = c(0.65, 35.65),
+                  expand = FALSE, clip = "off") +
+  theme_void(base_family = font_family, base_size = 11) +
+  theme(plot.margin = margin(3, 3, 3, 3, unit = "mm"))
+
+# 9. Display and export -----------------------------------------------------
+print(fig4)
+output_dir <- dirname(ever_file)
+output <- file.path(output_dir, "Figure_4_Model_B1_SharedLabels_B1-1_to_B1-4")
+
+if (isTRUE(capabilities("cairo"))) {
+  ggsave(paste0(output, ".pdf"), plot = fig4,
+         device = grDevices::cairo_pdf,
+         width = 30.3, height = 18, units = "cm", bg = "white")
+} else {
+  ggsave(paste0(output, ".pdf"), plot = fig4,
+         device = "pdf", width = 30.3, height = 18,
+         units = "cm", bg = "white")
+}
+ggsave(paste0(output, ".png"), plot = fig4,
+       width = 30.3, height = 18, units = "cm", dpi = 300, bg = "white")
+
+message("Figure 4 completed: ", nrow(results), " estimates; 4 panels; one label column.")
+message("PDF: ", paste0(output, ".pdf"))
+message("PNG: ", paste0(output, ".png"))
+```
+
+
+
+#Model B2 Interaction 
+```{r}
+# =====================================================================
+# Figure 4. Model B2 interaction forest plot (18 x 18 cm)
+# Source: Model B2_Dibao_Interaction_results.xlsx, Primary_Levels
+# Left: Never and Ever adjusted HRs; right: Ever/Never HR ratios.
+# HUKOU is displayed consistently with Figures 1-3:
+#   Agricultural vs Non-agricultural (reference).
+# IMPORTANT: This assumes source Rural = Agricultural hukou and
+# Urban = Non-agricultural hukou. Verify against the raw coding.
+# =====================================================================
+
+# install.packages(c("readxl", "ggplot2"))  # Only needed once
+library(readxl)
+library(ggplot2)
+
+# 1. Locate the latest Excel workbook ---------------------------------
+data_dir <- "/Users/apple/Desktop/Bag/rolling/Postgraduate/ADV/Week 4/data"
+folders <- c(data_dir, file.path(data_dir, "A_Cox_outputs"), getwd())
+folders <- unique(folders[dir.exists(folders)])
+
+files <- unlist(lapply(folders, function(d) {
+  list.files(d, pattern = "\\.xlsx$", full.names = TRUE, ignore.case = TRUE)
+}), use.names = FALSE)
+files <- unique(files[!grepl("^~\\$", basename(files))])
+
+stem <- "Model B2_Dibao_Interaction_results"
+clean_names <- sub("\\.xlsx$", "", basename(files), ignore.case = TRUE)
+clean_names <- sub("[[:space:]]*[(（][0-9]+[)）]$", "", clean_names)
+matches <- files[tolower(clean_names) == tolower(stem)]
+if (length(matches) == 0) stop("Cannot find Model B2 interaction workbook in data_dir or current folder.")
+
+plain <- matches[tolower(basename(matches)) == tolower(paste0(stem, ".xlsx"))]
+version3 <- matches[grepl("[(（]3[)）]\\.xlsx$", basename(matches))]
+if (length(plain) == 1) {
+  input_file <- plain[1]
+} else if (length(version3) == 1) {
+  input_file <- version3[1]
+} else if (length(matches) == 1) {
+  input_file <- matches[1]
+} else {
+  stop("Multiple Excel versions found; keep one intended file or rename it without the version number.")
+}
+message("Reading: ", normalizePath(input_file, mustWork = TRUE))
+
+# 2. Import exact ranges and verify original estimates ----------------
+# The source workbook has incorrect worksheet dimension metadata (A1).
+# Explicit ranges prevent an incomplete read.
+level <- as.data.frame(read_excel(input_file, sheet = "Primary_Levels",
+                                  range = "A1:AB14"))
+block <- as.data.frame(read_excel(input_file, sheet = "Primary_Block",
+                                  range = "A1:G9"))
+
+required <- c("analysis", "factor", "reference_level", "level",
+              "Never_HR", "Never_lower_95", "Never_upper_95",
+              "Ever_HR", "Ever_lower_95", "Ever_upper_95",
+              "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+              "interaction_p")
+if (!all(required %in% names(level))) {
+  stop("Missing fields in Primary_Levels: ",
+       paste(setdiff(required, names(level)), collapse = ", "))
+}
+if (nrow(level) != 13 || nrow(block) != 8) {
+  stop("Expected 13 Primary_Levels comparisons and 8 Primary_Block factors.")
+}
+if (!all(c("factor", "status") %in% names(block))) {
+  stop("Missing fields in Primary_Block.")
+}
+
+for (nm in c("analysis", "factor", "reference_level", "level")) {
+  level[[nm]] <- trimws(as.character(level[[nm]]))
+}
+block$factor <- trimws(as.character(block$factor))
+if (any(level$analysis != "Primary_Substantive") ||
+    !setequal(unique(level$factor), block$factor) ||
+    any(as.character(block$status) != "OK")) {
+  stop("Primary analysis labels, factor blocks, or model status are inconsistent.")
+}
+
+numeric_cols <- c("Never_HR", "Never_lower_95", "Never_upper_95",
+                  "Ever_HR", "Ever_lower_95", "Ever_upper_95",
+                  "HR_ratio_Ever_vs_Never", "ratio_lower_95", "ratio_upper_95",
+                  "interaction_p")
+for (nm in numeric_cols) level[[nm]] <- as.numeric(level[[nm]])
+if (any(!is.finite(as.matrix(level[, numeric_cols]))) ||
+    any(level$interaction_p < 0 | level$interaction_p > 1)) {
+  stop("Invalid numeric results or interaction p-values.")
+}
+for (group in c("Never", "Ever")) {
+  hr <- level[[paste0(group, "_HR")]]
+  lo <- level[[paste0(group, "_lower_95")]]
+  hi <- level[[paste0(group, "_upper_95")]]
+  if (any(lo <= 0 | lo > hr | hr > hi)) {
+    stop("Invalid ", group, " confidence interval.")
+  }
+}
+if (any(level$ratio_lower_95 <= 0 |
+        level$ratio_lower_95 > level$HR_ratio_Ever_vs_Never |
+        level$HR_ratio_Ever_vs_Never > level$ratio_upper_95)) {
+  stop("Invalid interaction ratio confidence intervals.")
+}
+if (any(abs(level$Ever_HR / level$Never_HR -
+            level$HR_ratio_Ever_vs_Never) > 1e-6)) {
+  stop("Interaction ratios do not equal Ever HR divided by Never HR.")
+}
+
+# 3. Match all 13 comparisons to the intended order -------------------
+# Keys refer to the ORIGINAL Excel (before recoding Hukou).
+layout <- data.frame(
+  factor = c("sex", "income_tertile", "income_tertile",
+             "marriage_status", "marriage_status", "marriage_status",
+             "living_children", "living_children", "living_children",
+             "coresident_child", "hukou", "adl", "iadl"),
+  reference_level = c("Male", "T1", "T1", "Partnered", "Partnered",
+                      "Partnered", "0", "0", "0", "No", "Rural",
+                      "Per 1 point", "Per 1 point"),
+  level = c("Female", "T2", "T3", "Widowed", "Separated-Divorced",
+            "Never married", "1", "2", "3+", "Yes", "Urban",
+            "Per 1 point", "Per 1 point"),
+  label = c("Female", "T2", "T3", "Widowed", "Separated/Divorced",
+            "Never married", "1 child", "2 children", "3+ children",
+            "Yes", "Agricultural", "Per 1-point increase",
+            "Per 1-point increase"),
+  section = c(1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 7, 8),
+  stringsAsFactors = FALSE
+)
+make_key <- function(d) paste(d$factor, d$reference_level, d$level, sep = "|")
+if (anyDuplicated(make_key(level)) ||
+    !setequal(make_key(level), make_key(layout))) {
+  stop("Excel factor/reference/level combinations differ from the expected 13 rows.")
+}
+level <- level[match(make_key(layout), make_key(level)), , drop = FALSE]
+
+# 4. REVERSE the Hukou contrast (not merely its displayed label) ------
+# Excel: Urban vs Rural. Plot: Agricultural vs Non-agricultural.
+# Valid only if Urban=Non-agricultural and Rural=Agricultural hukou.
+h <- which(level$factor == "hukou")
+if (length(h) != 1 || level$reference_level[h] != "Rural" ||
+    level$level[h] != "Urban") {
+  stop("Unexpected Hukou coding; reference reversal has been cancelled.")
+}
+
+for (group in c("Never", "Ever")) {
+  hr_col <- paste0(group, "_HR")
+  lo_col <- paste0(group, "_lower_95")
+  hi_col <- paste0(group, "_upper_95")
+  old_lo <- level[[lo_col]][h]
+  old_hi <- level[[hi_col]][h]
+  level[[hr_col]][h] <- 1 / level[[hr_col]][h]
+  level[[lo_col]][h] <- 1 / old_hi
+  level[[hi_col]][h] <- 1 / old_lo
+}
+old_ratio_lo <- level$ratio_lower_95[h]
+old_ratio_hi <- level$ratio_upper_95[h]
+level$HR_ratio_Ever_vs_Never[h] <- 1 / level$HR_ratio_Ever_vs_Never[h]
+level$ratio_lower_95[h] <- 1 / old_ratio_hi
+level$ratio_upper_95[h] <- 1 / old_ratio_lo
+level$reference_level[h] <- "Non-agricultural"
+level$level[h] <- "Agricultural"
+# interaction_p remains unchanged when the reference category is reversed.
+
+# Recheck the transformed ratio and confidence intervals.
+if (any(abs(level$Ever_HR / level$Never_HR -
+            level$HR_ratio_Ever_vs_Never) > 1e-6) ||
+    level$ratio_lower_95[h] > level$HR_ratio_Ever_vs_Never[h] ||
+    level$HR_ratio_Ever_vs_Never[h] > level$ratio_upper_95[h]) {
+  stop("The recoded Hukou estimates failed consistency checks.")
+}
+message(sprintf(
+  "HUKOU Agricultural vs Non-agricultural: Never %.3f; Ever %.3f; ratio %.3f; p %.3f",
+  level$Never_HR[h], level$Ever_HR[h],
+  level$HR_ratio_Ever_vs_Never[h], level$interaction_p[h]
+))
+
+# 5. Category headings and row positions -----------------------------
+headings <- c("SEX (ref: Male)", "INCOME (ref: T1)",
+              "MARITAL STATUS (ref: Partnered)",
+              "LIVING CHILDREN (ref: 0)",
+              "CHILD CORESIDENCE (ref: No)",
+              "HUKOU (ref: Non-agricultural)", "ADL", "IADL")
+row_y <- numeric(13)
+heading_y <- numeric(8)
+y <- 14.65
+for (s in 1:8) {
+  heading_y[s] <- y
+  y <- y - 0.54
+  for (i in which(layout$section == s)) {
+    row_y[i] <- y
+    y <- y - 0.48
+  }
+  y <- y - 0.15
+}
+heading_df <- data.frame(x = 7.43, y = heading_y, label = headings)
+label_df <- data.frame(x = 7.43, y = row_y, label = layout$label)
+
+# 6. Two logarithmic axes --------------------------------------------
+left_limits <- c(0.25, 4.5)
+right_limits <- c(0.14, 3.0)
+left_bounds <- c(7.85, 12.10)
+right_bounds <- c(13.15, 17.72)
+map_log <- function(value, limits, bounds) {
+  bounds[1] + (log(value) - log(limits[1])) /
+    (log(limits[2]) - log(limits[1])) * (bounds[2] - bounds[1])
+}
+if (any(c(level$Never_lower_95, level$Ever_lower_95) < left_limits[1]) ||
+    any(c(level$Never_upper_95, level$Ever_upper_95) > left_limits[2]) ||
+    any(level$ratio_lower_95 < right_limits[1]) ||
+    any(level$ratio_upper_95 > right_limits[2])) {
+  stop("An HR confidence interval lies outside a plotting scale.")
+}
+
+never <- data.frame(y = row_y + 0.11, type = "Never",
+                    hr = level$Never_HR, lo = level$Never_lower_95,
+                    hi = level$Never_upper_95, factor = level$factor)
+ever <- data.frame(y = row_y - 0.11, type = "Ever",
+                   hr = level$Ever_HR, lo = level$Ever_lower_95,
+                   hi = level$Ever_upper_95, factor = level$factor)
+left <- rbind(never, ever)
+left$x <- map_log(left$hr, left_limits, left_bounds)
+left$xlo <- map_log(left$lo, left_limits, left_bounds)
+left$xhi <- map_log(left$hi, left_limits, left_bounds)
+
+right <- data.frame(y = row_y,
+                    type = ifelse(level$interaction_p < 0.05,
+                                  "p < 0.05", "p >= 0.05"),
+                    hr = level$HR_ratio_Ever_vs_Never,
+                    lo = level$ratio_lower_95,
+                    hi = level$ratio_upper_95,
+                    factor = level$factor)
+right$x <- map_log(right$hr, right_limits, right_bounds)
+right$xlo <- map_log(right$lo, right_limits, right_bounds)
+right$xhi <- map_log(right$hi, right_limits, right_bounds)
+plot_data <- rbind(left, right)
+
+left_ticks <- c(0.5, 1, 2, 4)
+right_ticks <- c(0.2, 0.5, 1, 2)
+ticks <- data.frame(
+  x = c(map_log(left_ticks, left_limits, left_bounds),
+        map_log(right_ticks, right_limits, right_bounds)),
+  label = as.character(c(left_ticks, right_ticks))
+)
+
+# 7. Plot appearance --------------------------------------------------
+font <- "Times New Roman"
+pt_mm <- function(pt) pt * 25.4 / 72
+navy <- "#253F67"
+red <- "#B34E50"
+colors <- c("Never" = navy, "Ever" = red,
+            "p >= 0.05" = navy, "p < 0.05" = red)
+
+legend_items <- data.frame(
+  x = c(8.40, 10.46, 13.53, 15.84),
+  y = rep(15.55, 4),
+  type = c("Never", "Ever", "p >= 0.05", "p < 0.05"),
+  label = c("Never", "Ever", "p >= 0.05", "p < 0.05")
+)
+
+fig4 <- ggplot() +
+  # Gray HR=1 reference lines
+  annotate("segment", x = map_log(1, left_limits, left_bounds),
+           xend = map_log(1, left_limits, left_bounds),
+           y = 2.73, yend = 14.50, linetype = "dashed",
+           linewidth = 0.55, colour = "#888888") +
+  annotate("segment", x = map_log(1, right_limits, right_bounds),
+           xend = map_log(1, right_limits, right_bounds),
+           y = 2.73, yend = 14.50, linetype = "dashed",
+           linewidth = 0.55, colour = "#888888") +
+  # HR points and 95% confidence intervals
+  geom_segment(data = plot_data,
+               aes(x = xlo, xend = xhi, y = y, yend = y, colour = type),
+               linewidth = 0.72) +
+  geom_segment(data = plot_data,
+               aes(x = xlo, xend = xlo, y = y - 0.04,
+                   yend = y + 0.04, colour = type), linewidth = 0.42) +
+  geom_segment(data = plot_data,
+               aes(x = xhi, xend = xhi, y = y - 0.04,
+                   yend = y + 0.04, colour = type), linewidth = 0.42) +
+  geom_point(data = subset(plot_data, !factor %in% c("adl", "iadl")),
+             aes(x = x, y = y, colour = type), size = 2.5) +
+  geom_point(data = subset(plot_data, factor %in% c("adl", "iadl")),
+             aes(x = x, y = y, colour = type), size = 1.6) +
+  # Headings and labels: shared by both panels
+  geom_text(data = heading_df, aes(x = x, y = y, label = label),
+            family = font, fontface = "bold", hjust = 1,
+            size = pt_mm(12.2), colour = navy) +
+  geom_text(data = label_df, aes(x = x, y = y, label = label),
+            family = font, hjust = 1, size = pt_mm(11.5),
+            colour = "#252525") +
+  # Panel titles are above the legends (no overlap)
+  annotate("text", x = mean(left_bounds), y = 16.26,
+           label = "Group-specific HRs", family = font,
+           size = pt_mm(12), fontface = "bold") +
+  annotate("text", x = mean(right_bounds), y = 16.26,
+           label = "Interaction HR ratio", family = font,
+           size = pt_mm(12), fontface = "bold") +
+  # Two separate legends
+  geom_segment(data = legend_items,
+               aes(x = x - 0.22, xend = x + 0.08,
+                   y = y, yend = y, colour = type), linewidth = 0.7) +
+  geom_point(data = legend_items,
+             aes(x = x - 0.07, y = y, colour = type), size = 2.2) +
+  geom_text(data = legend_items,
+            aes(x = x + 0.18, y = y, label = label),
+            family = font, size = pt_mm(10), hjust = 0) +
+  # Horizontal axes, tick marks and labels
+  annotate("segment", x = left_bounds[1], xend = left_bounds[2],
+           y = 2.69, yend = 2.69, colour = "#333333", linewidth = 0.45) +
+  annotate("segment", x = right_bounds[1], xend = right_bounds[2],
+           y = 2.69, yend = 2.69, colour = "#333333", linewidth = 0.45) +
+  geom_segment(data = ticks,
+               aes(x = x, xend = x, y = 2.69, yend = 2.56),
+               linewidth = 0.40, colour = "#333333") +
+  geom_text(data = ticks, aes(x = x, y = 2.25, label = label),
+            family = font, size = pt_mm(11)) +
+  annotate("text", x = mean(left_bounds), y = 1.70,
+           label = "Hazard ratio (log scale)",
+           family = font, size = pt_mm(11)) +
+  annotate("text", x = mean(right_bounds), y = 1.70,
+           label = "HR ratio (log scale)",
+           family = font, size = pt_mm(11)) +
+  # Figure title, separated from panel titles and legends
+  annotate("text", x = 9, y = 17.38,
+           label = "Figure 4. Interaction Effects on Mortality Risk by Dibao Status,\nChina, 2011–2020 (Model B2)",
+           family = font, fontface = "bold", lineheight = 1.05,
+           size = pt_mm(12.0), hjust = 0.5) +
+  scale_colour_manual(values = colors, guide = "none") +
+  coord_cartesian(xlim = c(0, 18), ylim = c(0.95, 18.0),
+                  expand = FALSE, clip = "off") +
+  theme_void(base_family = font, base_size = 12) +
+  theme(plot.margin = margin(3, 3, 3, 3, unit = "mm"))
+
+# 8. Export -----------------------------------------------------------
+print(fig4)
+out <- file.path(dirname(input_file), "Figure_4_Model_B2_Hukou_Reference_Corrected_18cm")
+if (isTRUE(capabilities("cairo"))) {
+  ggsave(paste0(out, ".pdf"), plot = fig4,
+         device = grDevices::cairo_pdf,
+         width = 18, height = 18, units = "cm", bg = "white")
+} else {
+  ggsave(paste0(out, ".pdf"), plot = fig4, device = "pdf",
+         width = 18, height = 18, units = "cm", bg = "white")
+}
+ggsave(paste0(out, ".png"), plot = fig4, width = 18, height = 18,
+       units = "cm", dpi = 300, bg = "white")
+message("Figure 4 completed: 13 comparisons and 8 factor sections.")
+message("PDF: ", paste0(out, ".pdf"))
+message("PNG: ", paste0(out, ".png"))
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
